@@ -1,3 +1,15 @@
+"""Mochi - Tamagotchi-style Terminal Companion.
+
+This file serves as:
+1. A compatibility entry point for the legacy Tamagotchi mode
+2. A launcher for the new Mochi Edge AI Orchestrator UI
+
+Run with:
+    python -m tamagochi.mochi          # Legacy Tamagotchi mode
+    python -m tamagochi.mochi --modern # New Edge AI UI
+    python -m tamagochi.app            # Direct to new UI
+"""
+
 import os
 import random
 import sys
@@ -432,8 +444,17 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        clear_screen()
-        print("Mochi got interrupted but still loves you.")
+    # Check for --modern flag to launch new UI
+    if "--modern" in sys.argv or "--new" in sys.argv or "-m" in sys.argv:
+        print("Launching Mochi Edge AI Orchestrator UI...")
+        from tamagochi.app import main as modern_main
+        modern_main()
+    else:
+        # Run legacy Tamagotchi mode
+        try:
+            main()
+        except KeyboardInterrupt:
+            clear_screen()
+            print("Mochi got interrupted but still loves you.")
+        print("\n💡 Tip: Run with --modern flag for the new Edge AI UI!")
+        print("   python -m tamagochi.mochi --modern")
