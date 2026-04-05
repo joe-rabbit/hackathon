@@ -1,11 +1,17 @@
-# Hackathon Mochi
-
+# Mochi: terminal-based CLI for B2B or B2C edge networks monitoring and optimization. 
 ![Mochi Screenshot](image.png)
 
-## Setup
+## Setup Main System and Dashboard
 
 ```bash
+
+git clone https://github.com/joe-rabbit/hackathon.git
+```
+
+```bash
+cd hackathon
 python -m venv .venv
+
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -19,6 +25,7 @@ docker compose up -d
 Run the terminal app:
 
 ```bash
+docker compose exec app bash
 python -m tamagochi.app
 ```
 
@@ -26,6 +33,9 @@ Generate and push metrics:
 
 ```bash
 python dashboard/agent_token_analyszer.py --log-dir logs --sources copilot,claude --skip-dedup
+```
+
+```bash
 python dashboard/push_usage_to_influx.py --influx-url http://localhost:8086 --org hackathon --bucket metrics --token hackathon-dev-token --validate-measurements
 ```
 
@@ -56,7 +66,9 @@ hackthon-mochi/
 │   ├── flower.html
 │   └── connected_devices.json
 ├── pI/
-│   └── copiolot_fastapi_status.py
+│   ├── copilot_fastapi_status.py
+|   ├── server.py
+|   └── vision.py
 ├── logs/
 │   ├── copilot_usage_log.jsonl
 │   ├── prompt_efficiency_log.jsonl
@@ -70,10 +82,28 @@ hackthon-mochi/
 
 ## Server Installation
 
+for each node, run either Codex or PI server monitoring:
 - Codex
+```bash 
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+cd pI
+python3 copilot_fastapi_status.py
+```
 - PI
 
-## Tamagochi Usage
+```bash 
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+cd pI
+python3 server.py
+```
+
+## Tamagochi UI Usage
 
 Run:
 
@@ -102,4 +132,4 @@ Commands:
 - `/flower`
 - `/health`
 
-# Server Installation
+
