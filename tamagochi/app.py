@@ -507,6 +507,15 @@ def render_hero_nyan(state: AppState, width: int, height: int) -> list[str]:
     now = time.time()
     blinking = now < state.blink_until
 
+    # Life exhausted: remove the cat from the hero area.
+    if _safe_int(state.life_points, 0) <= 0:
+        hero_height = max(12, min(30, height // 3))
+        output_lines = [f"{fg(BORDER_COLOR)}{'─' * width}{RESET}"]
+        for _ in range(hero_height):
+            output_lines.append(" " * width)
+        output_lines.append(f"{fg(BORDER_COLOR)}{'─' * width}{RESET}")
+        return output_lines
+
     # Tail wag cadence
     if state.frame % 8 == 0:
         state.tail_frame = (state.tail_frame + 1) % 4
@@ -815,6 +824,7 @@ def render_hints(width: int) -> str:
         (f"{fg(PINK)}O{RESET}",             f"{fg(TEXT_DIMMER)}opt+sync{RESET}"),
         (f"{fg(PINK)}P{RESET}",             f"{fg(TEXT_DIMMER)}plan{RESET}"),
         (f"{fg(PINK)}F{RESET}",             f"{fg(TEXT_DIMMER)}feed{RESET}"),
+        (f"{fg(PINK)}S{RESET}",             f"{fg(TEXT_DIMMER)}scan{RESET}"),
         (f"{fg(PINK)}N{RESET}",             f"{fg(TEXT_DIMMER)}nap{RESET}"),
         (f"{fg(GREEN)}/agents{RESET}",      f"{fg(TEXT_DIMMER)}list{RESET}"),
         (f"{fg(GREEN)}/dashboard{RESET}",   f"{fg(TEXT_DIMMER)}open{RESET}"),
@@ -1157,6 +1167,58 @@ def trigger_carbon_plan(state: AppState) -> None:
     set_popup(state, "CarbonMin", f"Best device {top.get('ip')} at ci={_safe_float(top.get('ci')):.4f}", kind="info", ttl_s=3.0)
     state.mood = "thinking"
     state.mood_timer = 90
+
+
+def trigger_scan_carbon_efficiency(state: AppState) -> None:
+    # Refresh from latest analyzer/device signal before evaluating efficiency.
+    co2_kg, total_tokens, source = get_environment_signal(state)
+    update_environment_state(state, co2_kg, total_tokens, source)
+
+    rankings = build_device_efficiency_rankings(state)
+    if not rankings:
+        state.transcript.append(("warning", "scan", "Scan: no reachable devices for carbon check.", None))
+        set_popup(state, "Scan", "No reachable devices", kind="warn", ttl_s=2.8)
+        award_life_points(state, -1, reason="scan without device data")
+        state.mood = "sad"
+        state.mood_timer = 80
+        return
+
+    cis = [float(item.get("ci", 0.0)) for item in rankings if _safe_float(item.get("ci"), 0.0) > 0.0]
+    current_ci = co2_kg if co2_kg > 0 else _safe_float(rankings[0].get("ci"), 0.0)
+    cis.append(current_ci)
+    threshold = calculate_percentile(cis, state.carbon_threshold_percentile)
+    best_ip = str(rankings[0].get("ip", "unknown"))
+
+    if current_ci > threshold:
+        loss = 3
+        award_life_points(state, -loss, reason="not carbon efficient")
+        state.transcript.append((
+            "warning",
+            "scan",
+            (
+                f"Scan: NOT efficient (current={current_ci:.4f}kg > T={threshold:.4f}kg). "
+                f"Best device={best_ip} | usage_tokens={total_tokens} source={source}."
+            ),
+            None,
+        ))
+        set_popup(state, "Scan", f"Not efficient, -{loss} life", kind="warn", ttl_s=3.0)
+        state.mood = "warning"
+        state.mood_timer = 95
+    else:
+        gain = 1
+        award_life_points(state, gain, reason="carbon efficient scan")
+        state.transcript.append((
+            "ok",
+            "scan",
+            (
+                f"Scan: efficient (current={current_ci:.4f}kg <= T={threshold:.4f}kg). "
+                f"Best device={best_ip} | usage_tokens={total_tokens} source={source}."
+            ),
+            None,
+        ))
+        set_popup(state, "Scan", f"Carbon efficient, +{gain} life", kind="ok", ttl_s=3.0)
+        state.mood = "happy"
+        state.mood_timer = 80
 
 
 def trigger_feed_carbonmin(state: AppState) -> None:
@@ -1549,7 +1611,7 @@ def get_latest_copilot_emission_kg() -> tuple[float, int, str]:
     return 0.0, 0, "none"
 
 
-def trigger_optimize(state: AppState) -> None:
+def trigger_optimize(state: AppState, reason: str = "hotkey_o") -> None:
     """O key - optimize behavior and run ingest workflow together."""
     trigger_walk(state)
     co2_kg, total_tokens, source = get_environment_signal(state)
@@ -1582,7 +1644,7 @@ def trigger_optimize(state: AppState) -> None:
             None,
         ))
 
-    start_optimization_workflow(state, reason="hotkey_o")
+    start_optimization_workflow(state, reason=reason)
 
 
 def _latest_user_prompt(state: AppState) -> str:
@@ -1698,11 +1760,14 @@ def start_optimization_workflow(state: AppState, reason: str = "manual") -> None
             if summary_line:
                 notes.append(summary_line)
 
-            state.event_queue.put(("optimize_workflow", {"status": "ok", "notes": notes, "error": ""}))
+            state.event_queue.put((
+                "optimize_workflow",
+                {"status": "ok", "notes": notes, "error": "", "reason": reason},
+            ))
         except Exception as exc:
             state.event_queue.put((
                 "optimize_workflow",
-                {"status": "error", "notes": notes, "error": str(exc)},
+                {"status": "error", "notes": notes, "error": str(exc), "reason": reason},
             ))
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -1791,6 +1856,7 @@ def process_background_events(state: AppState) -> None:
             state.optimization_workflow_inflight = False
             state.last_workflow_run_at = time.time()
             notes = payload.get("notes") if isinstance(payload, dict) else None
+            workflow_reason = str(payload.get("reason", "manual")) if isinstance(payload, dict) else "manual"
             if payload.get("status") == "ok":
                 state.last_workflow_status = "ok"
                 state.last_workflow_error = ""
@@ -1804,15 +1870,18 @@ def process_background_events(state: AppState) -> None:
                     for note in notes:
                         state.transcript.append(("system", "workflow", str(note), None))
                 state.next_emission_refresh = 0.0
-                bonus = 8 + min(12, max(0, state.prompt_tokens_saved_recent // 120))
-                gained = award_life_points(state, bonus, reason="optimized workflow")
-                set_popup(
-                    state,
-                    "Optimize",
-                    f"Workflow complete, +{gained} life",
-                    kind="ok",
-                    ttl_s=3.0,
-                )
+                if workflow_reason == "auto_optimize":
+                    set_popup(state, "Optimize", "Auto optimize synced (-life applied)", kind="warn", ttl_s=3.0)
+                else:
+                    bonus = 8 + min(12, max(0, state.prompt_tokens_saved_recent // 120))
+                    gained = award_life_points(state, bonus, reason="optimized workflow")
+                    set_popup(
+                        state,
+                        "Optimize",
+                        f"Workflow complete, +{gained} life",
+                        kind="ok",
+                        ttl_s=3.0,
+                    )
                 state.mood = "celebrate"
                 state.mood_timer = 90
             else:
@@ -1837,7 +1906,7 @@ def handle_command(state: AppState, cmd: str) -> None:
         for c in ["/connect <ip[,ip2...]>", "/devices", "/agents [ip[,ip2...]]", "/inspect <name>", "/alerts", "/summary",
                   "/compare <name>", "/dashboard", "/level", "/flower", "/health", "/replay", "/clear"]:
             state.transcript.append(("system", "·", c, None))
-        state.transcript.append(("system", "·", "W=walk  O=optimize+sync  P=carbon-plan  F=feed-dispatch  N=nap  (hotkeys)", None))
+        state.transcript.append(("system", "·", "W=walk  O=optimize+sync  P=carbon-plan  F=feed-dispatch  S=scan  N=nap  (hotkeys)", None))
         state.mood = "happy"; state.mood_timer = 90
     elif cmd_lower.startswith("/connect"):
         parts = cmd.split(maxsplit=1)
@@ -2325,7 +2394,10 @@ def main() -> None:
                 if now >= state.next_auto_optimize_check and now >= state.auto_optimize_cooldown_until:
                     state.next_auto_optimize_check = now + AUTO_OPTIMIZE_INTERVAL_S
                     if state.latest_signal_source != "none" and state.latest_co2_kg >= CO2_THRESHOLD_KG:
-                        trigger_optimize(state)
+                        trigger_optimize(state, reason="auto_optimize")
+                        lost = award_life_points(state, -2, reason="auto optimize trigger")
+                        if lost != 0:
+                            set_popup(state, "Auto Optimize", f"Triggered, {lost} life", kind="warn", ttl_s=2.8)
                         state.auto_optimize_cooldown_until = now + AUTO_OPTIMIZE_COOLDOWN_S
                         state.transcript.append((
                             "warning",
@@ -2351,11 +2423,14 @@ def main() -> None:
                     elif key.lower() == "f" and not state.input_buffer:
                         trigger_feed_carbonmin(state)
 
+                    elif key.lower() == "s" and not state.input_buffer:
+                        trigger_scan_carbon_efficiency(state)
+
                     elif key.lower() == "n" and not state.input_buffer:
                         trigger_nap(state)
 
                     elif key.lower() == "o" and not state.input_buffer:
-                        trigger_optimize(state)
+                        trigger_optimize(state, reason="hotkey_o")
 
                     # ── Normal text input ────────────────────────────────────
                     elif key in ("\r", "\n"):
