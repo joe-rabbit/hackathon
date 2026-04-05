@@ -10,8 +10,14 @@ import time
 import math
 import random
 import re
+import json
+import glob
+import urllib.request
+import urllib.parse
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from typing import Optional
+from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLOR PALETTE
@@ -43,8 +49,22 @@ MOCHI_ARMS = "228"
 
 DASHBOARD_URL = "http://localhost:8086"
 
+# Optimize policy constants for O hotkey
+CO2_THRESHOLD_KG = 0.5
+GRID_KG_CO2E_PER_KWH = 0.384
+WH_PER_500_TOKENS = 15.0
+AUTO_OPTIMIZE_INTERVAL_S = 30.0
+AUTO_OPTIMIZE_COOLDOWN_S = 90.0
+
 RAINBOW_COLORS = ["196", "208", "226", "46", "27", "57", "129"]
 SPARKLE_CHARS = ["✦", "✧", "★", "☆", "·", "✸", "✺", "⋆", "*"]
+
+TOKEN_KEY_SETS = (
+    ("promptTokens", "completionTokens", "totalTokens"),
+    ("prompt_tokens", "completion_tokens", "total_tokens"),
+    ("inputTokens", "outputTokens", "totalTokens"),
+    ("input_tokens", "output_tokens", "total_tokens"),
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ANSI UTILITIES
@@ -151,6 +171,8 @@ class AppState:
     walk_until: float = 0.0
     walk_offset: int = 0
     walk_direction: int = 1  # 1 for right, -1 for left
+    next_auto_optimize_check: float = 0.0
+    auto_optimize_cooldown_until: float = 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -292,19 +314,135 @@ def get_cat_frame_data(mood: str, blinking: bool, frame: int, tail_frame: int = 
     return str_rows
 
 
+def load_cat_from_css(html_path=None):
+    """Parse CSS box-shadow and return pixel dict."""
+    if html_path is None:
+        html_path = os.path.join(os.path.dirname(__file__), 'cat.html')
+    try:
+        with open(html_path, 'r') as f:
+            html = f.read()
+    except Exception:
+        return {}
+    
+    match = re.search(r'box-shadow:\s*(.*?);', html, re.DOTALL)
+    if not match:
+        return {}
+    box_shadow = match.group(1)
+    
+    pattern = r'(\d+)px\s+(\d+)px\s+(#[0-9a-fA-F]+|rgb\([^)]+\)|transparent|white)'
+    matches = re.findall(pattern, box_shadow)
+    
+    pixels = {}
+    for x_str, y_str, color in matches:
+        x, y = int(x_str), int(y_str)
+        
+        if color == 'transparent':
+            continue
+        elif color == 'white':
+            r, g, b = 255, 255, 255
+        elif color.startswith('#'):
+            color = color.lstrip('#')
+            r = int(color[0:2], 16)
+            g = int(color[2:4], 16)
+            b = int(color[4:6], 16)
+        elif color.startswith('rgb'):
+            nums = re.findall(r'\d+', color)
+            r, g, b = int(nums[0]), int(nums[1]), int(nums[2])
+        else:
+            continue
+        
+        if y not in pixels:
+            pixels[y] = {}
+        pixels[y][x] = (r, g, b)
+    
+    return pixels
+
+_CSS_PIXELS = None
+
+# Mochi Animation Overrides
+_C = (220, 130, 150) # rosy cheek pink
+_H = (220, 40, 40)   # heart red
+_Z = (130, 170, 230) # zzz blue
+_S = (40,  40,  40)  # closed-eye dark gray
+
+EYE_L = {(8,11),(8,12),(9,11),(9,12),(9,13),(10,11),(10,12)}
+EYE_R = {(8,21),(9,20),(9,21),(9,22),(10,20),(10,21)}
+CHEEK_L = {(12,9),(13,9),(13,10)}
+CHEEK_R = {(12,26),(13,25),(13,26)}
+
 def render_mochi_sprite(mood: str, blinking: bool, frame: int, tail_frame: int = 0) -> tuple[list[str], int]:
-    rows = get_cat_frame_data(mood, blinking, frame, tail_frame)
+    global _CSS_PIXELS
+    if _CSS_PIXELS is None:
+        _CSS_PIXELS = load_cat_from_css()
+    
+    pixels = _CSS_PIXELS
+    if not pixels:
+        return ["  Cat HTML not found  "], 20
+
+    max_y = max(pixels.keys()) if pixels else 0
+    max_x = max(max(row.keys()) for row in pixels.values()) if pixels else 0
+    
+    # ── MUTATE PIXELS FOR ANIMATION ──
+    rendered_pixels = {}
+    for y in range(max_y + 1):
+        rendered_pixels[y] = {}
+        if y in pixels:
+            for x in pixels[y]:
+                rendered_pixels[y][x] = pixels[y][x]
+    
+    # Eyes
+    if blinking or mood in ("sleepy", "sleeping", "sad"):
+        eye_color = _S
+    elif mood in ("excited", "celebrate"):
+        eye_color = _H
+    else:
+        eye_color = (255, 255, 255)
+        
+    for r, c in EYE_L | EYE_R:
+        if r in rendered_pixels and c in rendered_pixels[r]:
+            if rendered_pixels[r][c] == (255, 255, 255):
+                rendered_pixels[r][c] = eye_color
+
+    # Cheeks
+    if mood in ("happy", "celebrate", "excited", "pet", "treat"):
+        for r, c in CHEEK_L | CHEEK_R:
+            if r in rendered_pixels and c in rendered_pixels[r]:
+                if rendered_pixels[r][c] not in ((255, 255, 255), (0, 0, 0)):
+                    rendered_pixels[r][c] = _C
+
+    # Sleeping Zzz
+    if mood == "sleeping":
+        zzz_phase = (frame // 20) % 4
+        zzz_pos = [(0, 9), (1, 7), (2, 5)]
+        for i in range(min(zzz_phase, 3)):
+            r, c = zzz_pos[i]
+            if r not in rendered_pixels: rendered_pixels[r] = {}
+            rendered_pixels[r][c] = _Z
+            
+    # ── RENDER WITH HALF-BLOCKS ──
     lines = []
-    for row in rows:
-        parts = []
-        for pixel in row:
-            color = CAT_COLORS.get(pixel)
-            if color:
-                parts.append(f"{color} {RESET}")   # 1 space per pixel - smaller
+    for y in range(0, max_y + 1, 2):
+        line = ""
+        for x in range(max_x + 1):
+            top_p = rendered_pixels.get(y, {}).get(x)
+            bot_p = rendered_pixels.get(y + 1, {}).get(x)
+            
+            if top_p and bot_p:
+                tr, tg, tb = top_p
+                br, bg, bb = bot_p
+                line += f"\033[38;2;{tr};{tg};{tb}m\033[48;2;{br};{bg};{bb}m▀\033[0m"
+            elif top_p:
+                tr, tg, tb = top_p
+                line += f"\033[38;2;{tr};{tg};{tb}m▀\033[0m"
+            elif bot_p:
+                br, bg, bb = bot_p
+                line += f"\033[38;2;{br};{bg};{bb}m▄\033[0m"
             else:
-                parts.append(" ")
-        lines.append("".join(parts))
-    return lines, CAT_SPRITE_WIDTH   # each pixel = 1 terminal col now
+                line += " "
+        lines.append(line)
+    
+    return lines, max_x + 1
+
 
 
 
@@ -315,20 +453,22 @@ def render_mochi_sprite(mood: str, blinking: bool, frame: int, tail_frame: int =
 
 def render_hero_nyan(state: AppState, width: int, height: int) -> list[str]:
     """Render cat centered in the screen."""
-    HERO_HEIGHT = min(20, max(16, height // 3))
-    SPRITE_COLS = CAT_SPRITE_WIDTH
-    SPRITE_ROWS = CAT_SPRITE_HEIGHT
-    
+    now = time.time()
+    blinking = now < state.blink_until
+
     # Tail wag cadence
     if state.frame % 8 == 0:
         state.tail_frame = (state.tail_frame + 1) % 4
+
+    sprite_lines, sw = render_mochi_sprite(state.mood, blinking, state.frame, state.tail_frame)
+    
+    SPRITE_COLS = sw
+    SPRITE_ROWS = len(sprite_lines)
+    HERO_HEIGHT = max(SPRITE_ROWS + 6, min(30, height // 3))
     
     # Cat positioning - center (with walking animation)
     cat_x = (width - SPRITE_COLS) // 2
     cat_y = (HERO_HEIGHT - SPRITE_ROWS) // 2
-    
-    now = time.time()
-    blinking = now < state.blink_until
     
     # Walking animation
     if now < state.walk_until:
@@ -336,13 +476,11 @@ def render_hero_nyan(state: AppState, width: int, height: int) -> list[str]:
         walk_progress = 1.0 - (state.walk_until - now) / 3.0
         
         if walk_progress < 0.5:
-            # First half: walk to the right
-            state.walk_offset = int(walk_progress * 2 * 8)  # Move 8 units right (reduced from 20)
+            state.walk_offset = int(walk_progress * 2 * 8)
             state.walk_direction = 1
         else:
-            # Second half: walk back to center
             reverse_progress = (walk_progress - 0.5) * 2
-            state.walk_offset = int(8 * (1.0 - reverse_progress))  # Move back from 8 to 0
+            state.walk_offset = int(8 * (1.0 - reverse_progress))
             state.walk_direction = -1
         
         cat_x += state.walk_offset
@@ -355,8 +493,6 @@ def render_hero_nyan(state: AppState, width: int, height: int) -> list[str]:
     if now < state.jump_until:
         progress = (state.jump_until - now) / 0.4
         jump_offset = int(math.sin(progress * math.pi) * 3)
-    
-    sprite_lines, sw = render_mochi_sprite(state.mood, blinking, state.frame, state.tail_frame)
     
     output_lines = []
     
@@ -372,12 +508,10 @@ def render_hero_nyan(state: AppState, width: int, height: int) -> list[str]:
             # Calculate left padding to position the cat
             sprite_line = sprite_lines[sprite_row]
             # Use visual width for positioning
-            effective_cat_x = max(0, min(cat_x, width - sw))  # sw is visual sprite width
+            effective_cat_x = max(0, min(cat_x, width - sw))
             left_pad = effective_cat_x
-            right_pad = width - left_pad - sw  # Calculate based on visual width
+            right_pad = max(0, width - left_pad - sw)
             
-            # Build the line: padding + sprite + padding
-            # Don't add extra padding to compensate for ANSI codes
             line_parts.append(" " * left_pad)
             line_parts.append(sprite_line)
             if right_pad > 0:
@@ -578,6 +712,7 @@ def render_hints(width: int) -> str:
         (f"{fg(GREEN)}{bold()}Enter{RESET}", f"{fg(TEXT_DIMMER)}send{RESET}"),
         (f"{fg(GREEN)}↑↓{RESET}",           f"{fg(TEXT_DIMMER)}scroll{RESET}"),
         (f"{fg(PINK)}W{RESET}",             f"{fg(TEXT_DIMMER)}walk{RESET}"),
+        (f"{fg(PINK)}O{RESET}",             f"{fg(TEXT_DIMMER)}optimize{RESET}"),
         (f"{fg(PINK)}P{RESET}",             f"{fg(TEXT_DIMMER)}party{RESET}"),
         (f"{fg(PINK)}N{RESET}",             f"{fg(TEXT_DIMMER)}nap{RESET}"),
         (f"{fg(GREEN)}/agents{RESET}",      f"{fg(TEXT_DIMMER)}list{RESET}"),
@@ -638,6 +773,136 @@ def trigger_nap(state: AppState) -> None:
     state.mood_timer = 200
 
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _tokens_from_node(node) -> int:
+    if isinstance(node, dict):
+        for prompt_key, completion_key, total_key in TOKEN_KEY_SETS:
+            if total_key in node:
+                return _safe_int(node.get(total_key), 0)
+            if prompt_key in node and completion_key in node:
+                return _safe_int(node.get(prompt_key), 0) + _safe_int(node.get(completion_key), 0)
+
+        subtotal = 0
+        for value in node.values():
+            subtotal += _tokens_from_node(value)
+        return subtotal
+
+    if isinstance(node, list):
+        subtotal = 0
+        for item in node:
+            subtotal += _tokens_from_node(item)
+        return subtotal
+
+    return 0
+
+
+def _tail_jsonl_records(path: Path, max_lines: int = 250) -> list[dict]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    except Exception:
+        return []
+
+    records = []
+    for line in lines[-max_lines:]:
+        try:
+            value = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records
+
+
+def _estimate_kg_from_tokens(total_tokens: int) -> float:
+    watt_hours = (max(total_tokens, 0) / 500.0) * WH_PER_500_TOKENS
+    return (watt_hours / 1000.0) * GRID_KG_CO2E_PER_KWH
+
+
+def get_latest_copilot_emission_kg() -> tuple[float, int, str]:
+    """Get latest CO2 estimate via dashboard token analyzer from VS Code user logs."""
+    try:
+        from dashboard import agent_token_analyszer as token_analyzer
+
+        workspace_storage_root = Path.home() / ".config" / "Code" / "User" / "workspaceStorage"
+        analyzer_args = SimpleNamespace(
+            session_file=[],
+            sessions_dir=None,
+            workspace_storage_root=workspace_storage_root,
+        )
+        session_files = token_analyzer.discover_session_files(analyzer_args)
+        if not session_files:
+            return 0.0, 0, "none"
+
+        summary, _ = token_analyzer.summarize(session_files)
+        totals = token_analyzer.aggregate_totals(summary)
+        if totals.total_tokens <= 0:
+            return 0.0, 0, "none"
+
+        _, energy_kwh = token_analyzer.compute_energy(totals.total_tokens, WH_PER_500_TOKENS)
+        co2_kg = energy_kwh * GRID_KG_CO2E_PER_KWH
+        return co2_kg, totals.total_tokens, "token_analyzer"
+    except Exception:
+        # Fallback to direct session payload parsing from VS Code user logs.
+        chat_glob = os.path.expanduser("~/.config/Code/User/workspaceStorage/*/chatSessions/*.jsonl")
+        chat_files = [Path(p) for p in glob.glob(chat_glob)]
+        chat_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for session_file in chat_files[:5]:
+            session_records = _tail_jsonl_records(session_file, max_lines=400)
+            for record in reversed(session_records):
+                total_tokens = _tokens_from_node(record)
+                if total_tokens > 0:
+                    return _estimate_kg_from_tokens(total_tokens), total_tokens, "vscode_chat_sessions"
+
+    return 0.0, 0, "none"
+
+
+def trigger_optimize(state: AppState) -> None:
+    """O key - walk first, then branch to nap/party by CO2 threshold."""
+    trigger_walk(state)
+    co2_kg, total_tokens, source = get_latest_copilot_emission_kg()
+
+    if source == "none":
+        trigger_party(state)
+        state.transcript.append((
+            "warning",
+            "optimize",
+            "Optimize: no Copilot usage logs found, defaulting to WALK -> PARTY.",
+            None,
+        ))
+        return
+
+    if co2_kg >= CO2_THRESHOLD_KG:
+        trigger_nap(state)
+        state.transcript.append((
+            "warning",
+            "optimize",
+            f"Optimize: WALK -> NAP (CO2={co2_kg:.4f}kg, tokens={total_tokens}, source={source}).",
+            None,
+        ))
+    else:
+        trigger_party(state)
+        state.transcript.append((
+            "ok",
+            "optimize",
+            f"Optimize: WALK -> PARTY (CO2={co2_kg:.4f}kg, tokens={total_tokens}, source={source}).",
+            None,
+        ))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # COMMAND HANDLING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -649,7 +914,7 @@ def handle_command(state: AppState, cmd: str) -> None:
         for c in ["/agents", "/inspect <name>", "/alerts", "/summary",
                   "/compare <name>", "/dashboard", "/replay", "/clear"]:
             state.transcript.append(("system", "·", c, None))
-        state.transcript.append(("system", "·", "W=walk  P=party  N=nap  (hotkeys)", None))
+        state.transcript.append(("system", "·", "W=walk  O=optimize  P=party  N=nap  (hotkeys)", None))
         state.mood = "happy"; state.mood_timer = 90
     elif cmd_lower == "/agents":
         state.transcript.append(("mochi", "Mochi", "Here are your agents:",
@@ -722,35 +987,73 @@ def handle_command(state: AppState, cmd: str) -> None:
         state.mood = "thinking"; state.mood_timer = 60
 
 
+def call_ollama(model: str, prompt: str, system_prompt: str = None) -> str:
+    """Call Ollama API to get LLM response."""
+    try:
+        ollama_base_url = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        url = f"{ollama_base_url}/api/generate"
+        data = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False
+        }
+        if system_prompt:
+            data["system"] = system_prompt
+        
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            return result.get('response', '').strip()
+    except urllib.error.URLError:
+        return "✦ Ollama API is not reachable. Check OLLAMA_HOST or start Ollama on the host."
+    except TimeoutError:
+        return "✦ LLM is loading... please try again in a moment."
+    except Exception as e:
+        return f"✦ Error: {str(e)[:100]}"
+
+
 def handle_natural_language(state: AppState, text: str) -> None:
-    text_lower = text.lower()
-    if re.search(r"camera|vision|hot", text_lower):
-        agent = next(a for a in MOCK_AGENTS if "Camera" in a["name"])
-        state.transcript.append(("mochi", "Mochi", "Camera Vision is the hottest agent!", None))
-        state.transcript.append(("mochi", "Mochi", "Details:", {"type": "detail", "agent": agent}))
-        state.mood = "warning"; state.mood_timer = 100
-    elif re.search(r"token|tok", text_lower):
-        total_tok = sum(a["tok"] for a in MOCK_AGENTS)
-        state.transcript.append(("mochi", "Mochi", f"Total token rate: {total_tok} tok/min", None))
-        state.mood = "thinking"; state.mood_timer = 60
-    elif re.search(r"optimi", text_lower):
-        state.transcript.append(("mochi", "Mochi",
-                                  "Optimizer already reduced waste from Camera Vision!", None))
-        state.transcript.append(("ok", "ok",
-                                  "Prompt compression saved 38% tokens in the last run.", None))
-        state.mood = "celebrate"; state.mood_timer = 90
-    elif re.search(r"hello|hi|hey", text_lower):
-        state.transcript.append(("mochi", "Mochi",
-                                  "Hello! I'm here to help you understand your edge agents. ✦", None))
-        state.mood = "happy"; state.mood_timer = 90
-    elif re.search(r"dashboard|web|browser", text_lower):
-        state.transcript.append(("mochi", "Mochi", "Here's your dashboard link:",
-                                  {"type": "dashboard"}))
-        state.mood = "happy"; state.mood_timer = 60
+    """Handle natural language input using Gemma3 LLM."""
+    
+    # System prompt for Mochii's personality - cute but precise
+    system_prompt = """You are Mochii, a cute AI assistant for edge-agent monitoring.
+Be direct and specific. Answer in 1-2 sentences max.
+No fluff, no emojis. Just the facts, cutely stated.
+Your name is Mochii (two i's).
+Focus: agents, tokens, performance, optimization."""
+    
+    # Add context
+    agent_context = f"\n\nCurrent agents: {', '.join(a['name'] for a in MOCK_AGENTS)}"
+    full_prompt = text + agent_context
+    
+    # Show thinking state
+    state.mood = "thinking"
+    state.mood_timer = 30
+    
+    # Call Ollama/Gemma3
+    response = call_ollama(state.model_name, full_prompt, system_prompt)
+    
+    # Add response to transcript
+    state.transcript.append(("mochi", "Mochii", response, None))
+    
+    # Set mood based on response sentiment
+    if any(word in response.lower() for word in ["great", "excellent", "perfect", "good", "nice", "optimized", "efficient"]):
+        state.mood = "happy"
+        state.mood_timer = 90
+    elif any(word in response.lower() for word in ["warning", "hot", "high", "issue", "problem", "concern"]):
+        state.mood = "warning"
+        state.mood_timer = 100
+    elif any(word in response.lower() for word in ["success", "improved", "reduced", "saved"]):
+        state.mood = "celebrate"
+        state.mood_timer = 90
     else:
-        state.transcript.append(("mochi", "Mochi",
-                                  "I'm not sure about that. Try /help for available commands.", None))
-        state.mood = "thinking"; state.mood_timer = 60
+        state.mood = "idle"
+        state.mood_timer = 60
 
 
 def handle_input(state: AppState, text: str) -> None:
@@ -843,6 +1146,20 @@ def main() -> None:
                     if state.mood_timer == 0:
                         state.mood = "idle"
 
+                # Auto-optimize when emissions cross threshold.
+                if now >= state.next_auto_optimize_check and now >= state.auto_optimize_cooldown_until:
+                    state.next_auto_optimize_check = now + AUTO_OPTIMIZE_INTERVAL_S
+                    co2_kg, total_tokens, source = get_latest_copilot_emission_kg()
+                    if source != "none" and co2_kg >= CO2_THRESHOLD_KG:
+                        trigger_optimize(state)
+                        state.auto_optimize_cooldown_until = now + AUTO_OPTIMIZE_COOLDOWN_S
+                        state.transcript.append((
+                            "warning",
+                            "optimize",
+                            f"Auto optimize triggered: CO2={co2_kg:.3f}kg (tokens={total_tokens}) >= {CO2_THRESHOLD_KG:.3f}kg.",
+                            None,
+                        ))
+
                 # ── Key handling ──────────────────────────────────────────────
                 key = reader.read_key()
                 if key:
@@ -859,6 +1176,9 @@ def main() -> None:
 
                     elif key.lower() == "n" and not state.input_buffer:
                         trigger_nap(state)
+
+                    elif key.lower() == "o" and not state.input_buffer:
+                        trigger_optimize(state)
 
                     # ── Normal text input ────────────────────────────────────
                     elif key in ("\r", "\n"):

@@ -23,6 +23,15 @@ services:
     networks:
       - hackathon-network
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: hackathon-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - hackathon-network
+
   app:
     build:
       context: .
@@ -36,8 +45,10 @@ services:
       - ./requirements.txt:/hackathon/requirements.txt
     environment:
       - DASHBOARD_URL=http://influxdb:8086
+      - OLLAMA_HOST=http://ollama:11434
     depends_on:
       - influxdb
+      - ollama
     networks:
       - hackathon-network
     stdin_open: true
@@ -47,6 +58,7 @@ services:
 volumes:
   influxdb2-data:
   influxdb2-config:
+  ollama-data:
 
 networks:
   hackathon-network:

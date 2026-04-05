@@ -52,7 +52,7 @@ HARDWARE_PROFILES: dict[str, HardwareProfile] = {
 # Side Effects: Reads command-line arguments from process invocation.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Summarize Copilot token usage per agent from chatSessions JSONL files."
+        description="Summarize Copilot token usage per agent from VS Code chatSessions and Copilot logs."
     )
     parser.add_argument(
         "--sessions-dir",
@@ -71,7 +71,13 @@ def parse_args() -> argparse.Namespace:
         "--workspace-storage-root",
         type=Path,
         default=None,
-        help="Path to workspaceStorage root (contains many IDs).",
+        help="Path to workspaceStorage root (contains many IDs and chatSessions).",
+    )
+    parser.add_argument(
+        "--copilot-logs-dir",
+        type=Path,
+        default=Path("logs") / "copilot_raw",
+        help="Directory with copied Copilot chat/session logs (default: ./logs/copilot_raw).",
     )
     parser.add_argument(
         "--watch",
@@ -334,14 +340,44 @@ def print_hardware_estimate(hardware_profile: str, hardware: dict[str, float]) -
     )
 
 
-# Purpose: Locate default VS Code workspaceStorage directory on Windows profile.
+# Purpose: Locate default VS Code workspaceStorage directories across OSes.
 # Inputs: None.
-# Outputs: Path when found, otherwise None.
+# Outputs: Existing workspaceStorage roots.
 # Side Effects: None.
-def default_workspace_storage_root() -> Path | None:
-    appdata = Path.home() / "AppData" / "Roaming"
-    candidate = appdata / "Code" / "User" / "workspaceStorage"
-    return candidate if candidate.exists() else None
+def default_workspace_storage_roots() -> list[Path]:
+    home = Path.home()
+    candidates = [
+        # Linux
+        home / ".config" / "Code" / "User" / "workspaceStorage",
+        home / ".config" / "Code - OSS" / "User" / "workspaceStorage",
+        # macOS
+        home / "Library" / "Application Support" / "Code" / "User" / "workspaceStorage",
+        home / "Library" / "Application Support" / "Code - OSS" / "User" / "workspaceStorage",
+        # Windows
+        home / "AppData" / "Roaming" / "Code" / "User" / "workspaceStorage",
+        home / "AppData" / "Roaming" / "Code - OSS" / "User" / "workspaceStorage",
+    ]
+    return [p for p in candidates if p.exists()]
+
+
+# Purpose: Locate default VS Code log directories across OSes.
+# Inputs: None.
+# Outputs: Existing VS Code log roots.
+# Side Effects: None.
+def default_vscode_log_roots() -> list[Path]:
+    home = Path.home()
+    candidates = [
+        # Linux
+        home / ".config" / "Code" / "logs",
+        home / ".config" / "Code - OSS" / "logs",
+        # macOS
+        home / "Library" / "Application Support" / "Code" / "logs",
+        home / "Library" / "Application Support" / "Code - OSS" / "logs",
+        # Windows
+        home / "AppData" / "Roaming" / "Code" / "logs",
+        home / "AppData" / "Roaming" / "Code - OSS" / "logs",
+    ]
+    return [p for p in candidates if p.exists()]
 
 
 # Purpose: Discover session JSONL files from explicit, directory, or auto-discovered sources.
@@ -352,19 +388,55 @@ def discover_session_files(args: argparse.Namespace) -> list[Path]:
     if args.session_file:
         return [p for p in args.session_file if p.exists()]
 
+    files: set[Path] = set()
+
+    # First priority: explicit sessions directory.
     if args.sessions_dir:
-        return sorted(args.sessions_dir.rglob("*.jsonl"))
+        files.update(p for p in args.sessions_dir.rglob("*.jsonl") if p.is_file())
+        files.update(p for p in args.sessions_dir.rglob("*.log") if p.is_file())
 
-    root = args.workspace_storage_root or default_workspace_storage_root()
-    if root is None or not root.exists():
-        return []
+    # Second priority: copied local logs folder in this project.
+    copilot_logs_dir = getattr(args, "copilot_logs_dir", None)
+    if copilot_logs_dir and isinstance(copilot_logs_dir, Path) and copilot_logs_dir.exists():
+        files.update(p for p in copilot_logs_dir.rglob("*.jsonl") if p.is_file())
+        files.update(p for p in copilot_logs_dir.rglob("*.log") if p.is_file())
 
-    files: list[Path] = []
-    for ws in root.iterdir():
-        sessions_dir = ws / "chatSessions"
-        if sessions_dir.exists() and sessions_dir.is_dir():
-            files.extend(sorted(sessions_dir.glob("*.jsonl")))
-    return files
+    # If we already found logs from explicit/local sources, return those.
+    if files:
+        return sorted(files)
+
+    roots: list[Path] = []
+    if args.workspace_storage_root and args.workspace_storage_root.exists():
+        roots.append(args.workspace_storage_root)
+    else:
+        roots.extend(default_workspace_storage_roots())
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for ws in root.iterdir():
+            if not ws.is_dir():
+                continue
+            sessions_dir = ws / "chatSessions"
+            if sessions_dir.exists() and sessions_dir.is_dir():
+                files.update(p for p in sessions_dir.glob("*.jsonl") if p.is_file())
+
+            # Copilot Chat extension storage files can also contain JSONL events.
+            copilot_chat_dir = ws / "GitHub.copilot-chat"
+            if copilot_chat_dir.exists() and copilot_chat_dir.is_dir():
+                files.update(p for p in copilot_chat_dir.rglob("*.jsonl") if p.is_file())
+                files.update(p for p in copilot_chat_dir.rglob("*.log") if p.is_file())
+
+    # Also include VS Code runtime log directories with Copilot/Chat event logs.
+    for log_root in default_vscode_log_roots():
+        for p in log_root.rglob("*.jsonl"):
+            if p.is_file() and ("copilot" in str(p).lower() or "chat" in str(p).lower()):
+                files.add(p)
+        for p in log_root.rglob("*.log"):
+            if p.is_file() and ("copilot" in str(p).lower() or "chat" in str(p).lower()):
+                files.add(p)
+
+    return sorted(files)
 
 
 # Purpose: Normalize scalar values to int for token fields when valid.
@@ -751,7 +823,7 @@ def main() -> int:
 
     if not files:
         print("No session files found.")
-        print("Try --sessions-dir or --workspace-storage-root.")
+        print("Try --sessions-dir, --copilot-logs-dir, or --workspace-storage-root.")
         return 1
 
     summary, model_summary = summarize(files)
