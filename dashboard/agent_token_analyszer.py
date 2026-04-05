@@ -28,6 +28,7 @@ TOKEN_KEY_SETS = (
     ("prompt_tokens", "completion_tokens", "total_tokens"),
     ("inputTokens", "outputTokens", "totalTokens"),
     ("input_tokens", "output_tokens", "total_tokens"),
+    ("input", "output", "totalTokens"), # openclaw format
 )
 
 
@@ -915,11 +916,20 @@ def collect_response_text(response_items: Any) -> str:
 # Outputs: List of request dictionaries.
 # Side Effects: None.
 def extract_requests_from_line(line_obj: dict[str, Any]) -> list[dict[str, Any]]:
+    # Standard VS Code Copilot format
     kind = line_obj.get("kind")
     if kind == 2 and line_obj.get("k") == ["requests"]:
         value = line_obj.get("v")
         if isinstance(value, list):
             return [r for r in value if isinstance(r, dict)]
+    
+    # openclaw format
+    if line_obj.get("type") == "message":
+        message = line_obj.get("message")
+        if isinstance(message, dict):
+            # Wrap message in a dict so it can be processed like a request
+            return [line_obj]
+            
     return []
 
 
@@ -928,6 +938,13 @@ def extract_requests_from_line(line_obj: dict[str, Any]) -> list[dict[str, Any]]
 # Outputs: Model identifier string, or "unknown".
 # Side Effects: None.
 def extract_model_name(req: dict[str, Any]) -> str:
+    # openclaw format
+    message = req.get("message")
+    if isinstance(message, dict):
+        model = message.get("model")
+        if isinstance(model, str):
+            return model
+
     model_id = req.get("modelId")
     if isinstance(model_id, str) and model_id.strip():
         return model_id.strip()
