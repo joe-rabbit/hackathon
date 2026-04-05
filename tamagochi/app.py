@@ -12,12 +12,22 @@ import random
 import re
 import json
 import glob
+import subprocess
+import threading
+import queue
 import urllib.request
 import urllib.parse
+import urllib.error
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
+
+# Add project root to sys.path to allow importing from the parent directory
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
 
 from prompt_optimizer import optimize_prompt
 
@@ -50,13 +60,21 @@ MOCHI_MOUTH = "210"
 MOCHI_ARMS = "228"
 
 DASHBOARD_URL = "http://localhost:8086"
+DEVICE_STATUS_PORT = 8000
+CONNECTED_DEVICES_FILE = Path(__file__).with_name("connected_devices.json")
+USAGE_SNAPSHOT_FILE = REPO_ROOT / "logs" / "copilot_usage_log.jsonl"
+PROMPT_EFFICIENCY_LOG_FILE = REPO_ROOT / "logs" / "prompt_efficiency_log.jsonl"
+INGEST_HEARTBEAT_FILE = REPO_ROOT / "logs" / "influx_ingest_heartbeat.json"
+ANALYZER_SCRIPT = REPO_ROOT / "dashboard" / "agent_token_analyszer.py"
+INFLUX_PUSH_SCRIPT = REPO_ROOT / "dashboard" / "push_usage_to_influx.py"
 
 # Optimize policy constants for O hotkey
-CO2_THRESHOLD_KG = 0.5
+CO2_THRESHOLD_KG = 0.08
 GRID_KG_CO2E_PER_KWH = 0.384
 WH_PER_500_TOKENS = 15.0
 AUTO_OPTIMIZE_INTERVAL_S = 30.0
 AUTO_OPTIMIZE_COOLDOWN_S = 90.0
+EMISSION_REFRESH_INTERVAL_S = 10.0
 
 RAINBOW_COLORS = ["196", "208", "226", "46", "27", "57", "129"]
 SPARKLE_CHARS = ["✦", "✧", "★", "☆", "·", "✸", "✺", "⋆", "*"]
@@ -151,6 +169,9 @@ CAT_MESSAGES = {
     "pet":       ["purrr~", "♥", "uwu", "*leans in*", "soft..."],
 }
 
+CarbonTask = dict[str, object]
+
+
 @dataclass
 class AppState:
     running: bool = True
@@ -176,6 +197,33 @@ class AppState:
     next_auto_optimize_check: float = 0.0
     auto_optimize_cooldown_until: float = 0.0
     last_system_prompt_sent: str = ""
+    known_devices: list[str] = field(default_factory=list)
+    latest_co2_kg: float = 0.0
+    latest_tokens: int = 0
+    latest_signal_source: str = "none"
+    eco_level: int = 1
+    flower_stage: str = "seed"
+    next_emission_refresh: float = 0.0
+    prompt_tokens_saved_recent: int = 0
+    prompt_carbon_saved_recent_g: float = 0.0
+    emission_poll_inflight: bool = False
+    llm_inflight: bool = False
+    optimization_workflow_inflight: bool = False
+    last_workflow_status: str = "idle"
+    last_workflow_error: str = ""
+    last_workflow_run_at: float = 0.0
+    carbon_threshold_percentile: float = 25.0
+    carbon_max_delay_s: float = 300.0
+    carbon_task_queue: list[CarbonTask] = field(default_factory=list)
+    carbon_allocation_history: list[CarbonTask] = field(default_factory=list)
+    last_device_rankings: list[dict] = field(default_factory=list)
+    popup_title: str = ""
+    popup_detail: str = ""
+    popup_kind: str = "info"
+    popup_until: float = 0.0
+    life_points: int = 35
+    life_points_max: int = 100
+    event_queue: queue.Queue = field(default_factory=queue.Queue)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -538,7 +586,7 @@ def render_status_line(state: AppState, width: int) -> str:
     total_agents = len(MOCK_AGENTS)
     hot_agents   = sum(1 for a in MOCK_AGENTS if a["status"] == "HOT")
     alert_count  = len(MOCK_ALERTS)
-    total_tok    = sum(a["tok"] for a in MOCK_AGENTS)
+    total_tok = state.latest_tokens if state.latest_tokens > 0 else sum(a["tok"] for a in MOCK_AGENTS)
 
     parts = [
         f"{fg(PINK)}{bold()}Mochi{RESET}",
@@ -551,13 +599,43 @@ def render_status_line(state: AppState, width: int) -> str:
         f"{fg(TEXT_DIM)}|{RESET}",
         f"{fg(HOT)}{alert_count} alert{RESET}" if alert_count else f"{fg(TEXT_DIM)}0 alerts{RESET}",
         f"{fg(TEXT_DIM)}|{RESET}",
-        f"{fg(TEXT_DIM)}{total_tok} tok/min{RESET}",
+        f"{fg(TEXT_DIM)}{total_tok} tokens{RESET}",
         f"{fg(TEXT_DIM)}|{RESET}",
         f"{fg(TEXT_DIM)}{state.model_name}{RESET}",
+        f"{fg(TEXT_DIM)}|{RESET}",
+        f"{fg(MINT)}L{state.eco_level}:{state.flower_stage}{RESET}",
+        f"{fg(TEXT_DIM)}|{RESET}",
+        f"{fg(TEXT_DIM)}save {state.prompt_tokens_saved_recent} tok{RESET}",
+        f"{fg(TEXT_DIM)}|{RESET}",
+        f"{fg(TEXT_DIM)}co2 {state.latest_co2_kg:.4f}kg{RESET}",
         f"{fg(TEXT_DIM)}|{RESET}",
         f"{fg(GREEN)}d: dashboard{RESET}",
     ]
     return f"{bg(BG_SURFACE2)}{' '.join(parts)}{RESET}"
+
+
+def render_life_bar(state: AppState, cells: int = 10) -> str:
+    max_points = max(1, _safe_int(state.life_points_max, 100))
+    life = max(0, min(max_points, _safe_int(state.life_points, 0)))
+    ratio = life / max_points
+    filled = int(round(ratio * max(1, cells)))
+    filled = max(0, min(cells, filled))
+    empty = max(0, cells - filled)
+    color = GREEN if ratio >= 0.6 else (YELLOW if ratio >= 0.3 else HOT)
+    bar = f"[{('#' * filled)}{('-' * empty)}]"
+    return f"{fg(color)}life {life:>3}/{max_points} {bar}{RESET}"
+
+
+def render_life_line(state: AppState, width: int) -> str:
+    life_bar = render_life_bar(state, cells=16)
+    text = f" {life_bar} "
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    if len(plain) > width:
+        life_bar = render_life_bar(state, cells=10)
+        text = f" {life_bar} "
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    pad = max(0, width - len(plain))
+    return f"{bg(BG_SURFACE)}{text}{' ' * pad}{RESET}"
 
 
 def render_welcome(width: int) -> list[str]:
@@ -566,6 +644,7 @@ def render_welcome(width: int) -> list[str]:
         ("I explain edge-agent behavior and optimization.", TEXT_DIM, False),
         ("Type /agents, /inspect camera-agent, or ask me anything.", TEXT_DIM, False),
         (f"Dashboard running at {DASHBOARD_URL}", GREEN, False),
+        ("Tip: /level shows carbon-linked flower progression.", TEXT_DIM, False),
     ]
     out = [""]
     for text, color, is_bold in lines_text:
@@ -700,6 +779,24 @@ def render_card(card_data: dict, width: int) -> list[str]:
             f"  {fg(TEXT_DIM)}Open in browser for charts and trends.{RESET}",
             "",
         ]
+    elif card_type == "carbon_plan":
+        devices = card_data.get("devices", [])
+        threshold = _safe_float(card_data.get("threshold"), 0.0)
+        current_ci = _safe_float(card_data.get("current_ci"), 0.0)
+        lines.append("")
+        lines.append(f"  {fg(PINK)}{bold()}CarbonMin Device Ranking{RESET}")
+        lines.append(f"  {fg(TEXT_DIM)}CurrentCI={current_ci:.4f}kg | Threshold={threshold:.4f}kg{RESET}")
+        header = f"{'DEVICE':<16} {'CI(kg)':>10} {'TOKENS':>10} {'CPU%':>7} {'EFF':>12}"
+        lines.append(f"  {fg(TEXT_DIM)}{header}{RESET}")
+        lines.append(f"  {fg(BORDER_COLOR)}{'─' * len(header)}{RESET}")
+        for item in devices:
+            dev = str(item.get("ip", "unknown"))[:16].ljust(16)
+            ci = f"{_safe_float(item.get('ci')):.4f}".rjust(10)
+            tok = str(_safe_int(item.get("tokens"))).rjust(10)
+            cpu = f"{_safe_float(item.get('cpu')):.1f}".rjust(7)
+            eff = f"{_safe_float(item.get('perf_per_carbon')):.1f}".rjust(12)
+            lines.append(f"  {fg(TEXT_MAIN)}{dev}{RESET} {fg(TEXT_DIM)}{ci} {tok} {cpu} {eff}{RESET}")
+        lines.append("")
     return lines
 
 
@@ -715,8 +812,9 @@ def render_hints(width: int) -> str:
         (f"{fg(GREEN)}{bold()}Enter{RESET}", f"{fg(TEXT_DIMMER)}send{RESET}"),
         (f"{fg(GREEN)}↑↓{RESET}",           f"{fg(TEXT_DIMMER)}scroll{RESET}"),
         (f"{fg(PINK)}W{RESET}",             f"{fg(TEXT_DIMMER)}walk{RESET}"),
-        (f"{fg(PINK)}O{RESET}",             f"{fg(TEXT_DIMMER)}optimize{RESET}"),
-        (f"{fg(PINK)}P{RESET}",             f"{fg(TEXT_DIMMER)}party{RESET}"),
+        (f"{fg(PINK)}O{RESET}",             f"{fg(TEXT_DIMMER)}opt+sync{RESET}"),
+        (f"{fg(PINK)}P{RESET}",             f"{fg(TEXT_DIMMER)}plan{RESET}"),
+        (f"{fg(PINK)}F{RESET}",             f"{fg(TEXT_DIMMER)}feed{RESET}"),
         (f"{fg(PINK)}N{RESET}",             f"{fg(TEXT_DIMMER)}nap{RESET}"),
         (f"{fg(GREEN)}/agents{RESET}",      f"{fg(TEXT_DIMMER)}list{RESET}"),
         (f"{fg(GREEN)}/dashboard{RESET}",   f"{fg(TEXT_DIMMER)}open{RESET}"),
@@ -733,6 +831,8 @@ def render_screen(state: AppState) -> str:
     output = []
 
     output.append(render_status_line(state, cols))
+    output.append(render_popup_line(state, cols))
+    output.append(render_life_line(state, cols))
     output.extend(render_hero_nyan(state, cols, rows))
     output.extend(render_welcome(cols))
     output.append(render_divider(cols))
@@ -750,6 +850,22 @@ def render_screen(state: AppState) -> str:
 
     padded = [clear_line() + line for line in output]
     return "\033[H" + hide_cursor() + "\n".join(padded)
+
+
+def render_popup_line(state: AppState, width: int) -> str:
+    if time.time() > state.popup_until or not state.popup_title:
+        return f"{bg(BG_SURFACE)}{' ' * width}{RESET}"
+
+    kind_color = {
+        "ok": GREEN,
+        "warn": HOT,
+        "info": MINT,
+    }.get(state.popup_kind, MINT)
+    msg = f" {state.popup_title}: {state.popup_detail} "
+    if len(msg) > width:
+        msg = msg[: max(0, width - 3)] + "..."
+    pad = max(0, width - len(msg))
+    return f"{bg(BG_SURFACE)}{fg(kind_color)}{bold()}{msg}{RESET}{bg(BG_SURFACE)}{' ' * pad}{RESET}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -788,6 +904,348 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def normalize_ipv4(candidate: str) -> Optional[str]:
+    """Validate and normalize an IPv4 address string."""
+    value = candidate.strip()
+    value = re.sub(r"^https?://", "", value, flags=re.IGNORECASE)
+    value = value.split("/", 1)[0]
+
+    # Accept host:port format and keep host part.
+    if ":" in value:
+        host, port = value.rsplit(":", 1)
+        if port and not port.isdigit():
+            return None
+        value = host
+
+    if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", value):
+        return None
+
+    octets = value.split(".")
+    for octet in octets:
+        n = int(octet)
+        if n < 0 or n > 255:
+            return None
+    return ".".join(str(int(o)) for o in octets)
+
+
+def parse_ip_list(raw: str) -> tuple[list[str], list[str]]:
+    """Parse one or more IPs from a comma/space separated string."""
+    tokens = [t for t in re.split(r"[\s,]+", raw.strip()) if t]
+    valid: list[str] = []
+    invalid: list[str] = []
+    seen = set()
+
+    for token in tokens:
+        normalized = normalize_ipv4(token)
+        if normalized:
+            if normalized not in seen:
+                valid.append(normalized)
+                seen.add(normalized)
+        else:
+            invalid.append(token)
+
+    return valid, invalid
+
+
+def load_known_devices() -> list[str]:
+    try:
+        if not CONNECTED_DEVICES_FILE.exists():
+            return []
+        data = json.loads(CONNECTED_DEVICES_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return []
+
+        cleaned = []
+        seen = set()
+        for item in data:
+            if not isinstance(item, str):
+                continue
+            ip = normalize_ipv4(item)
+            if ip and ip not in seen:
+                cleaned.append(ip)
+                seen.add(ip)
+        return cleaned
+    except Exception:
+        return []
+
+
+def save_known_devices(devices: list[str]) -> None:
+    try:
+        CONNECTED_DEVICES_FILE.write_text(json.dumps(devices, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def fetch_device_status(ip: str) -> tuple[Optional[dict], Optional[str]]:
+    url = f"http://{ip}:{DEVICE_STATUS_PORT}/status"
+    try:
+        with urllib.request.urlopen(url, timeout=2.5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                return None, "invalid JSON payload"
+            return payload, None
+    except urllib.error.URLError as exc:
+        return None, str(exc.reason)
+    except TimeoutError:
+        return None, "request timed out"
+    except Exception as exc:
+        return None, str(exc)
+
+
+def set_popup(state: AppState, title: str, detail: str, kind: str = "info", ttl_s: float = 3.0) -> None:
+    state.popup_title = title
+    state.popup_detail = detail
+    state.popup_kind = kind
+    state.popup_until = time.time() + max(0.5, ttl_s)
+
+
+def award_life_points(state: AppState, amount: int, reason: str) -> int:
+    if amount == 0:
+        return 0
+    max_points = max(1, _safe_int(state.life_points_max, 100))
+    before = max(0, min(max_points, _safe_int(state.life_points, 0)))
+    after = max(0, min(max_points, before + amount))
+    delta = after - before
+    state.life_points = after
+    if delta != 0:
+        state.transcript.append((
+            "system",
+            "life",
+            f"Life {'+' if delta > 0 else ''}{delta} ({reason}) -> {after}/{max_points}",
+            None,
+        ))
+    return delta
+
+
+def calculate_percentile(values: list[float], percentile: float) -> float:
+    data = sorted(v for v in values if v >= 0)
+    if not data:
+        return 0.0
+    if len(data) == 1:
+        return data[0]
+    p = max(0.0, min(100.0, percentile)) / 100.0
+    idx = p * (len(data) - 1)
+    lo = int(math.floor(idx))
+    hi = int(math.ceil(idx))
+    if lo == hi:
+        return data[lo]
+    frac = idx - lo
+    return data[lo] * (1.0 - frac) + data[hi] * frac
+
+
+def _device_carbon_intensity(payload: dict) -> float:
+    kg = _safe_float(payload.get("kg_co2e"), 0.0)
+    if kg > 0:
+        return kg
+    energy_wh = _safe_float(payload.get("energy_wh"), 0.0)
+    if energy_wh > 0:
+        return (energy_wh / 1000.0) * GRID_KG_CO2E_PER_KWH
+    return 0.0
+
+
+def build_device_efficiency_rankings(state: AppState) -> list[dict]:
+    rankings: list[dict] = []
+    for ip in state.known_devices:
+        payload, err = fetch_device_status(ip)
+        if err or not payload:
+            continue
+        ci = _device_carbon_intensity(payload)
+        tok = _safe_int(payload.get("total_tokens"), 0)
+        cpu = _safe_float(payload.get("cpu_usage"), 0.0)
+        perf = (tok + 1) / max(ci, 0.000001)
+        rankings.append({
+            "ip": ip,
+            "ci": ci,
+            "tokens": tok,
+            "cpu": cpu,
+            "perf_per_carbon": perf,
+        })
+
+    rankings.sort(key=lambda r: (r.get("ci", 0.0), -r.get("perf_per_carbon", 0.0), r.get("cpu", 0.0)))
+    state.last_device_rankings = rankings
+    return rankings
+
+
+def _estimate_feed_tokens(state: AppState) -> int:
+    if state.prompt_tokens_saved_recent > 0:
+        return max(50, min(1200, state.prompt_tokens_saved_recent))
+    if state.latest_tokens > 0:
+        return max(50, min(1200, int(state.latest_tokens * 0.08)))
+    return 200
+
+
+def _enqueue_carbon_task(state: AppState, tokens: int) -> CarbonTask:
+    task: CarbonTask = {
+        "id": f"task-{int(time.time() * 1000)}",
+        "arrival_time": time.time(),
+        "tokens": max(1, tokens),
+        "status": "queued",
+        "assigned_ip": "",
+        "decision": "defer",
+    }
+    state.carbon_task_queue.append(task)
+    return task
+
+
+def run_carbonmin_scheduler(state: AppState) -> dict:
+    rankings = build_device_efficiency_rankings(state)
+    cis = [float(item.get("ci", 0.0)) for item in rankings if _safe_float(item.get("ci"), 0.0) > 0]
+    if state.latest_co2_kg > 0:
+        cis.append(state.latest_co2_kg)
+    threshold = calculate_percentile(cis, state.carbon_threshold_percentile)
+    current_ci = cis[0] if cis else state.latest_co2_kg
+
+    dispatched = 0
+    deferred = 0
+    best = rankings[0] if rankings else None
+
+    for task in list(state.carbon_task_queue):
+        if str(task.get("status")) != "queued":
+            continue
+        age_s = max(0.0, time.time() - _safe_float(task.get("arrival_time"), time.time()))
+        should_dispatch = (current_ci <= threshold) or (age_s >= state.carbon_max_delay_s)
+        if should_dispatch and best:
+            task["status"] = "dispatched"
+            task["assigned_ip"] = str(best.get("ip", ""))
+            task["decision"] = "dispatch"
+            task["dispatch_time"] = time.time()
+            task["threshold"] = threshold
+            task["current_ci"] = current_ci
+            state.carbon_allocation_history.append(dict(task))
+            state.carbon_task_queue.remove(task)
+            dispatched += 1
+        else:
+            task["decision"] = "defer"
+            task["threshold"] = threshold
+            task["current_ci"] = current_ci
+            deferred += 1
+
+    return {
+        "threshold": threshold,
+        "current_ci": current_ci,
+        "dispatched": dispatched,
+        "deferred": deferred,
+        "best": best,
+        "rankings": rankings,
+    }
+
+
+def trigger_carbon_plan(state: AppState) -> None:
+    result = run_carbonmin_scheduler(state)
+    rankings = result.get("rankings", [])
+    if not rankings:
+        state.transcript.append(("warning", "carbon", "No reachable devices for CarbonMin planning.", None))
+        set_popup(state, "CarbonMin", "No reachable devices", kind="warn", ttl_s=3.0)
+        state.mood = "sad"
+        state.mood_timer = 80
+        return
+
+    threshold = _safe_float(result.get("threshold"), 0.0)
+    current_ci = _safe_float(result.get("current_ci"), 0.0)
+    top = rankings[0]
+    state.transcript.append((
+        "mochi",
+        "Mochi",
+        (
+            f"CarbonMin plan: current_ci={current_ci:.4f}kg threshold(p{int(state.carbon_threshold_percentile)})={threshold:.4f}kg | "
+            f"best={top.get('ip')}"
+        ),
+        {"type": "carbon_plan", "devices": rankings[:5], "threshold": threshold, "current_ci": current_ci},
+    ))
+    set_popup(state, "CarbonMin", f"Best device {top.get('ip')} at ci={_safe_float(top.get('ci')):.4f}", kind="info", ttl_s=3.0)
+    state.mood = "thinking"
+    state.mood_timer = 90
+
+
+def trigger_feed_carbonmin(state: AppState) -> None:
+    tokens = _estimate_feed_tokens(state)
+    task = _enqueue_carbon_task(state, tokens)
+    state.transcript.append(("system", "carbon", f"Queued {tokens} tokens for CarbonMin task {task['id']}", None))
+    set_popup(state, "Feed", f"Queued {tokens} tokens for smart dispatch", kind="info", ttl_s=2.5)
+
+    result = run_carbonmin_scheduler(state)
+    dispatched = _safe_int(result.get("dispatched"), 0)
+    deferred = _safe_int(result.get("deferred"), 0)
+    threshold = _safe_float(result.get("threshold"), 0.0)
+    current_ci = _safe_float(result.get("current_ci"), 0.0)
+    best = result.get("best") if isinstance(result.get("best"), dict) else None
+
+    if dispatched > 0 and best:
+        ip = str(best.get("ip", "unknown"))
+        state.transcript.append((
+            "ok",
+            "carbon",
+            f"Dispatched {tokens} tokens to {ip} (ci={_safe_float(best.get('ci')):.4f} <= T={threshold:.4f}).",
+            None,
+        ))
+        set_popup(state, "Feed Dispatch", f"{tokens} tokens -> {ip}", kind="ok", ttl_s=3.2)
+        trigger_party(state)
+    else:
+        state.transcript.append((
+            "warning",
+            "carbon",
+            f"Deferred task {task['id']} (ci={current_ci:.4f} > T={threshold:.4f}); queued until greener window/max delay.",
+            None,
+        ))
+        set_popup(state, "Feed Deferred", f"Waiting greener window ({deferred} queued)", kind="warn", ttl_s=3.2)
+        state.mood = "thinking"
+        state.mood_timer = 80
+
+
+def build_roster_from_status(ip: str, payload: dict) -> list[dict]:
+    roster = []
+    raw_agents = payload.get("agents", [])
+    top_cpu = _safe_float(payload.get("cpu_usage", 0.0), 0.0)
+    top_mem = _safe_float(payload.get("mem_usage", 0.0), 0.0)
+    top_latency = _safe_float(payload.get("latency_ms", payload.get("latency", 0.0)), 0.0)
+    top_temp = _safe_float(payload.get("temp", 0.0), 0.0)
+    top_energy_wh = _safe_float(payload.get("energy_wh", 0.0), 0.0)
+    top_kg_co2e = _safe_float(payload.get("kg_co2e", 0.0), 0.0)
+    payload_total_tokens = _safe_int(payload.get("total_tokens", 0), 0)
+
+    if not isinstance(raw_agents, list):
+        raw_agents = []
+
+    for item in raw_agents:
+        if not isinstance(item, dict):
+            continue
+        cpu = _safe_float(item.get("cpu", top_cpu), top_cpu)
+        mem_mb = _safe_float(item.get("memory_mb", top_mem), top_mem)
+        latency_ms = _safe_float(item.get("latency_ms", item.get("latency", top_latency)), top_latency)
+        # Treat HOT as actual compute pressure, not token-share metrics.
+        status = "HOT" if cpu >= 80.0 or top_temp >= 70.0 else "OK"
+        optimizer = str(item.get("importance", "none"))
+        name = str(item.get("name", "agent"))
+        tok = _safe_int(item.get("total_tokens", item.get("tok", payload_total_tokens)), 0)
+
+        roster.append({
+            "name": f"{name}@{ip}",
+            "cpu": int(round(cpu)),
+            "mem": int(round(mem_mb)),
+            "tok": tok,
+            "status": status,
+            "latency": int(round(latency_ms)),
+            "temp": _safe_float(payload.get("temp", 0.0), 0.0),
+            "optimizer": optimizer,
+        })
+
+    # If the endpoint reports only top-level metrics, still render one useful row.
+    if not roster:
+        status = "HOT" if top_cpu >= 80.0 or top_temp >= 70.0 else "OK"
+        roster.append({
+            "name": f"device@{ip}",
+            "cpu": int(round(top_cpu)),
+            "mem": int(round(top_mem)),
+            "tok": payload_total_tokens,
+            "status": status,
+            "latency": int(round(top_latency)),
+            "temp": top_temp,
+            "optimizer": f"energy={top_energy_wh:.6f}Wh co2={top_kg_co2e:.6g}kg",
+        })
+
+    return roster
 
 
 def _tokens_from_node(node) -> int:
@@ -830,13 +1288,231 @@ def _tail_jsonl_records(path: Path, max_lines: int = 250) -> list[dict]:
     return records
 
 
+def _latest_snapshot_record(path: Path) -> Optional[dict]:
+    records = _tail_jsonl_records(path, max_lines=32)
+    if not records:
+        return None
+    return records[-1]
+
+
+def _snapshot_emission_kg(path: Path) -> tuple[float, int, str]:
+    rec = _latest_snapshot_record(path)
+    if not isinstance(rec, dict):
+        return 0.0, 0, "none"
+    totals = rec.get("totals") if isinstance(rec.get("totals"), dict) else {}
+    energy = rec.get("energy") if isinstance(rec.get("energy"), dict) else {}
+    total_tokens = _safe_int(totals.get("total_tokens"), 0)
+    kwh = _safe_float(energy.get("kwh"), 0.0)
+    if total_tokens <= 0:
+        return 0.0, 0, "none"
+    if kwh <= 0:
+        kwh = (max(total_tokens, 0) / 500.0) * WH_PER_500_TOKENS / 1000.0
+    return kwh * GRID_KG_CO2E_PER_KWH, total_tokens, "usage_snapshot"
+
+
 def _estimate_kg_from_tokens(total_tokens: int) -> float:
     watt_hours = (max(total_tokens, 0) / 500.0) * WH_PER_500_TOKENS
     return (watt_hours / 1000.0) * GRID_KG_CO2E_PER_KWH
 
 
+def _parse_iso_ts(value: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _read_recent_jsonl(path: Path, max_lines: int = 400) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    except Exception:
+        return []
+
+    out = []
+    for line in lines[-max_lines:]:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def recent_prompt_efficiency(window_minutes: int = 60) -> dict:
+    now = datetime.now(timezone.utc)
+    records = _read_recent_jsonl(PROMPT_EFFICIENCY_LOG_FILE, max_lines=600)
+    tokens_saved = 0
+    carbon_saved_g = 0.0
+    events = 0
+    latest_ts = None
+
+    for record in records:
+        ts_raw = record.get("timestamp")
+        if not isinstance(ts_raw, str):
+            continue
+        ts = _parse_iso_ts(ts_raw)
+        if ts is None:
+            continue
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+
+        age_s = (now - ts).total_seconds()
+        if age_s > max(60, window_minutes * 60):
+            continue
+
+        events += 1
+        tokens_saved += _safe_int(record.get("tokens_saved"), 0)
+        carbon_saved_g += _safe_float(record.get("carbon_saved_g"), 0.0)
+
+    return {
+        "events": events,
+        "tokens_saved": max(tokens_saved, 0),
+        "carbon_saved_g": max(carbon_saved_g, 0.0),
+        "latest_ts": latest_ts.isoformat() if latest_ts else None,
+    }
+
+
+def load_ingest_heartbeat() -> dict:
+    if not INGEST_HEARTBEAT_FILE.exists():
+        return {}
+    try:
+        data = json.loads(INGEST_HEARTBEAT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def file_age_seconds(path: Path) -> Optional[float]:
+    if not path.exists():
+        return None
+    try:
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def compute_eco_level_and_flower(co2_kg: float, prompt_tokens_saved: int = 0) -> tuple[int, str]:
+    """Lower CO2 raises base level; prompt savings can boost flower progression."""
+    if co2_kg <= 0.01:
+        base_level = 5
+    elif co2_kg <= 0.03:
+        base_level = 4
+    elif co2_kg <= 0.08:
+        base_level = 3
+    elif co2_kg <= 0.20:
+        base_level = 2
+    else:
+        base_level = 1
+
+    bonus = 0
+    if prompt_tokens_saved >= 250:
+        bonus = 2
+    elif prompt_tokens_saved >= 80:
+        bonus = 1
+
+    level = min(5, base_level + bonus)
+    stage_by_level = {
+        1: "seed",
+        2: "sprout",
+        3: "bud",
+        4: "flower",
+        5: "bloom",
+    }
+    return level, stage_by_level[level]
+
+
+def update_environment_state(state: AppState, co2_kg: float, total_tokens: int, source: str) -> None:
+    prompt_stats = recent_prompt_efficiency(window_minutes=60)
+    tokens_saved = _safe_int(prompt_stats.get("tokens_saved"), 0)
+    carbon_saved_g = _safe_float(prompt_stats.get("carbon_saved_g"), 0.0)
+    state.latest_co2_kg = co2_kg
+    state.latest_tokens = total_tokens
+    state.latest_signal_source = source
+    level, flower = compute_eco_level_and_flower(co2_kg, prompt_tokens_saved=tokens_saved)
+    state.eco_level = level
+    state.flower_stage = flower
+    state.prompt_tokens_saved_recent = tokens_saved
+    state.prompt_carbon_saved_recent_g = carbon_saved_g
+
+
+def build_health_report(state: AppState) -> dict:
+    prompt_age = file_age_seconds(PROMPT_EFFICIENCY_LOG_FILE)
+    usage_age = file_age_seconds(USAGE_SNAPSHOT_FILE)
+
+    reachable = 0
+    for ip in state.known_devices:
+        _, err = fetch_device_status(ip)
+        if not err:
+            reachable += 1
+
+    heartbeat = load_ingest_heartbeat()
+    hb_status = str(heartbeat.get("status", "missing")) if heartbeat else "missing"
+    hb_age = None
+    ts = heartbeat.get("timestamp") if isinstance(heartbeat, dict) else None
+    if isinstance(ts, str):
+        hb_dt = _parse_iso_ts(ts)
+        if hb_dt is not None:
+            hb_age = max(0.0, (datetime.now(timezone.utc) - hb_dt).total_seconds())
+
+    validation = heartbeat.get("validation") if isinstance(heartbeat, dict) else None
+    validated = 0
+    if isinstance(validation, dict):
+        validated = sum(1 for v in validation.values() if v)
+
+    return {
+        "prompt_log_exists": PROMPT_EFFICIENCY_LOG_FILE.exists(),
+        "prompt_log_age_s": prompt_age,
+        "usage_snapshot_exists": USAGE_SNAPSHOT_FILE.exists(),
+        "usage_snapshot_age_s": usage_age,
+        "emission_poll_inflight": state.emission_poll_inflight,
+        "llm_inflight": state.llm_inflight,
+        "optimize_workflow_inflight": state.optimization_workflow_inflight,
+        "optimize_workflow_status": state.last_workflow_status,
+        "optimize_workflow_error": state.last_workflow_error,
+        "optimize_workflow_last_run_age_s": (
+            max(0.0, time.time() - state.last_workflow_run_at)
+            if state.last_workflow_run_at > 0
+            else None
+        ),
+        "devices_configured": len(state.known_devices),
+        "devices_reachable": reachable,
+        "influx_heartbeat_status": hb_status,
+        "influx_heartbeat_age_s": hb_age,
+        "influx_points_written": _safe_int(heartbeat.get("points_written"), 0) if heartbeat else 0,
+        "influx_valid_measurements": validated,
+    }
+
+
+def get_environment_signal(state: AppState) -> tuple[float, int, str]:
+    """Prefer connected device status, fall back to local Copilot logs."""
+    total_kg = 0.0
+    total_tokens = 0
+    reachable = 0
+    for ip in state.known_devices:
+        payload, err = fetch_device_status(ip)
+        if err or not payload:
+            continue
+        reachable += 1
+        total_kg += _safe_float(payload.get("kg_co2e", 0.0), 0.0)
+        total_tokens += _safe_int(payload.get("total_tokens", 0), 0)
+
+    if reachable > 0:
+        return total_kg, total_tokens, "device_status"
+
+    return get_latest_copilot_emission_kg()
+
+
 def get_latest_copilot_emission_kg() -> tuple[float, int, str]:
     """Get latest CO2 estimate via dashboard token analyzer from VS Code user logs."""
+    # Fast path: use local usage snapshot written by analyzer/watch pipeline.
+    snap_kg, snap_tokens, snap_source = _snapshot_emission_kg(USAGE_SNAPSHOT_FILE)
+    if snap_source != "none":
+        return snap_kg, snap_tokens, snap_source
+
     try:
         from dashboard import agent_token_analyszer as token_analyzer
 
@@ -874,9 +1550,10 @@ def get_latest_copilot_emission_kg() -> tuple[float, int, str]:
 
 
 def trigger_optimize(state: AppState) -> None:
-    """O key - walk first, then branch to nap/party by CO2 threshold."""
+    """O key - optimize behavior and run ingest workflow together."""
     trigger_walk(state)
-    co2_kg, total_tokens, source = get_latest_copilot_emission_kg()
+    co2_kg, total_tokens, source = get_environment_signal(state)
+    update_environment_state(state, co2_kg, total_tokens, source)
 
     if source == "none":
         trigger_party(state)
@@ -905,6 +1582,249 @@ def trigger_optimize(state: AppState) -> None:
             None,
         ))
 
+    start_optimization_workflow(state, reason="hotkey_o")
+
+
+def _latest_user_prompt(state: AppState) -> str:
+    for entry in reversed(state.transcript):
+        if len(entry) < 3:
+            continue
+        entry_type, _, text, _ = entry
+        if entry_type != "user" or not isinstance(text, str):
+            continue
+        candidate = text.strip()
+        if candidate and not candidate.startswith("/"):
+            return candidate
+    return ""
+
+
+def _format_workflow_error(stage: str, result: subprocess.CompletedProcess) -> str:
+    output = (result.stderr or result.stdout or "").strip().splitlines()
+    detail = output[-1] if output else "no output"
+    return f"{stage} failed (exit={result.returncode}): {detail}"
+
+
+def start_optimization_workflow(state: AppState, reason: str = "manual") -> None:
+    if state.optimization_workflow_inflight:
+        state.transcript.append((
+            "warning",
+            "optimize",
+            "Optimize workflow already running...",
+            None,
+        ))
+        set_popup(state, "Optimize", "Workflow already running", kind="warn", ttl_s=2.5)
+        return
+
+    seed_prompt = _latest_user_prompt(state)
+    state.optimization_workflow_inflight = True
+    state.last_workflow_status = "running"
+    state.last_workflow_error = ""
+    state.transcript.append((
+        "system",
+        "workflow",
+        "Optimize workflow started: prompt -> analyzer -> Influx ingest.",
+        None,
+    ))
+    set_popup(state, "Optimize", "Prompt -> analyzer -> ingest running", kind="info", ttl_s=3.0)
+
+    def _worker() -> None:
+        notes: list[str] = []
+        try:
+            if seed_prompt:
+                result = optimize_prompt(
+                    seed_prompt,
+                    last_system_prompt=state.last_system_prompt_sent,
+                    source=f"tamagochi.{reason}",
+                )
+                if result.events:
+                    saved = sum(event.tokens_saved for event in result.events)
+                    notes.append(f"prompt optimized ({saved} tokens est. saved)")
+                else:
+                    notes.append("prompt optimizer found no rewrite")
+            else:
+                notes.append("no recent user prompt to optimize")
+
+            analyzer_cmd = [
+                sys.executable,
+                str(ANALYZER_SCRIPT),
+                "--log-dir",
+                str(REPO_ROOT / "logs"),
+                "--sources",
+                "copilot,claude",
+                "--skip-dedup",
+            ]
+            analyzer = subprocess.run(
+                analyzer_cmd,
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if analyzer.returncode != 0:
+                raise RuntimeError(_format_workflow_error("analyzer", analyzer))
+
+            influx_token = os.getenv("INFLUX_TOKEN", "hackathon-dev-token").strip()
+            influx_url = os.getenv("INFLUX_URL", "http://localhost:8086").strip()
+            influx_org = os.getenv("INFLUX_ORG", "hackathon").strip()
+            influx_bucket = os.getenv("INFLUX_BUCKET", "metrics").strip()
+            ingest_cmd = [
+                sys.executable,
+                str(INFLUX_PUSH_SCRIPT),
+                "--influx-url",
+                influx_url,
+                "--org",
+                influx_org,
+                "--bucket",
+                influx_bucket,
+                "--token",
+                influx_token,
+                "--validate-measurements",
+            ]
+            ingest = subprocess.run(
+                ingest_cmd,
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if ingest.returncode != 0:
+                raise RuntimeError(_format_workflow_error("influx ingest", ingest))
+
+            summary_line = ""
+            for line in reversed((ingest.stdout or "").splitlines()):
+                if line.strip():
+                    summary_line = line.strip()
+                    break
+            if summary_line:
+                notes.append(summary_line)
+
+            state.event_queue.put(("optimize_workflow", {"status": "ok", "notes": notes, "error": ""}))
+        except Exception as exc:
+            state.event_queue.put((
+                "optimize_workflow",
+                {"status": "error", "notes": notes, "error": str(exc)},
+            ))
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def start_emission_poll(state: AppState) -> None:
+    if state.emission_poll_inflight:
+        return
+
+    state.emission_poll_inflight = True
+
+    def _worker() -> None:
+        try:
+            co2_kg, total_tokens, source = get_environment_signal(state)
+            state.event_queue.put(("emission", (co2_kg, total_tokens, source)))
+        except Exception as exc:
+            state.event_queue.put(("emission_error", str(exc)))
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def start_llm_request(
+    state: AppState,
+    optimized_prompt: str,
+    optimized_system_prompt: str,
+    max_tokens: int | None,
+    system_prompt: str,
+) -> None:
+    if state.llm_inflight:
+        state.transcript.append(("warning", "alert", "LLM already processing a request...", None))
+        return
+
+    state.llm_inflight = True
+
+    def _worker() -> None:
+        try:
+            response = call_ollama(
+                state.model_name,
+                optimized_prompt,
+                optimized_system_prompt or None,
+                max_tokens=max_tokens,
+            )
+            state.event_queue.put(("llm", {"response": response, "system_prompt": system_prompt}))
+        except Exception as exc:
+            state.event_queue.put(("llm", {"response": f"✦ Error: {exc}", "system_prompt": system_prompt}))
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _apply_response_mood(state: AppState, response: str) -> None:
+    lower = response.lower()
+    if any(word in lower for word in ["great", "excellent", "perfect", "good", "nice", "optimized", "efficient"]):
+        state.mood = "happy"
+        state.mood_timer = 90
+    elif any(word in lower for word in ["warning", "hot", "high", "issue", "problem", "concern"]):
+        state.mood = "warning"
+        state.mood_timer = 100
+    elif any(word in lower for word in ["success", "improved", "reduced", "saved"]):
+        state.mood = "celebrate"
+        state.mood_timer = 90
+    else:
+        state.mood = "idle"
+        state.mood_timer = 60
+
+
+def process_background_events(state: AppState) -> None:
+    while True:
+        try:
+            event, payload = state.event_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        if event == "emission":
+            state.emission_poll_inflight = False
+            co2_kg, total_tokens, source = payload
+            update_environment_state(state, co2_kg, total_tokens, source)
+        elif event == "emission_error":
+            state.emission_poll_inflight = False
+        elif event == "llm":
+            state.llm_inflight = False
+            response = str(payload.get("response", ""))
+            state.last_system_prompt_sent = str(payload.get("system_prompt", ""))
+            state.transcript.append(("mochi", "Mochii", response, None))
+            _apply_response_mood(state, response)
+        elif event == "optimize_workflow":
+            state.optimization_workflow_inflight = False
+            state.last_workflow_run_at = time.time()
+            notes = payload.get("notes") if isinstance(payload, dict) else None
+            if payload.get("status") == "ok":
+                state.last_workflow_status = "ok"
+                state.last_workflow_error = ""
+                state.transcript.append((
+                    "ok",
+                    "workflow",
+                    "Optimize workflow complete.",
+                    None,
+                ))
+                if isinstance(notes, list):
+                    for note in notes:
+                        state.transcript.append(("system", "workflow", str(note), None))
+                state.next_emission_refresh = 0.0
+                bonus = 8 + min(12, max(0, state.prompt_tokens_saved_recent // 120))
+                gained = award_life_points(state, bonus, reason="optimized workflow")
+                set_popup(
+                    state,
+                    "Optimize",
+                    f"Workflow complete, +{gained} life",
+                    kind="ok",
+                    ttl_s=3.0,
+                )
+                state.mood = "celebrate"
+                state.mood_timer = 90
+            else:
+                state.last_workflow_status = "error"
+                err = str(payload.get("error", "workflow failed")) if isinstance(payload, dict) else "workflow failed"
+                state.last_workflow_error = err
+                state.transcript.append(("warning", "workflow", f"Optimize workflow failed: {err}", None))
+                award_life_points(state, -2, reason="optimize workflow failure")
+                set_popup(state, "Optimize", "Workflow failed, -2 life", kind="warn", ttl_s=3.0)
+                state.mood = "warning"
+                state.mood_timer = 110
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COMMAND HANDLING
@@ -914,15 +1834,171 @@ def handle_command(state: AppState, cmd: str) -> None:
     cmd_lower = cmd.lower().strip()
     if cmd_lower == "/help":
         state.transcript.append(("mochi", "Mochi", "Here are the available commands:", None))
-        for c in ["/agents", "/inspect <name>", "/alerts", "/summary",
-                  "/compare <name>", "/dashboard", "/replay", "/clear"]:
+        for c in ["/connect <ip[,ip2...]>", "/devices", "/agents [ip[,ip2...]]", "/inspect <name>", "/alerts", "/summary",
+                  "/compare <name>", "/dashboard", "/level", "/flower", "/health", "/replay", "/clear"]:
             state.transcript.append(("system", "·", c, None))
-        state.transcript.append(("system", "·", "W=walk  O=optimize  P=party  N=nap  (hotkeys)", None))
+        state.transcript.append(("system", "·", "W=walk  O=optimize+sync  P=carbon-plan  F=feed-dispatch  N=nap  (hotkeys)", None))
         state.mood = "happy"; state.mood_timer = 90
-    elif cmd_lower == "/agents":
-        state.transcript.append(("mochi", "Mochi", "Here are your agents:",
-                                  {"type": "roster", "agents": MOCK_AGENTS}))
-        state.mood = "thinking"; state.mood_timer = 60
+    elif cmd_lower.startswith("/connect"):
+        parts = cmd.split(maxsplit=1)
+        if len(parts) < 2:
+            state.transcript.append(("mochi", "Mochi", "Usage: /connect <ip[,ip2,...]>", None))
+            state.mood = "thinking"
+            state.mood_timer = 50
+            return
+
+        valid_ips, invalid_ips = parse_ip_list(parts[1])
+        if invalid_ips:
+            state.transcript.append((
+                "warning",
+                "alert",
+                f"Invalid IP(s): {', '.join(invalid_ips)}",
+                None,
+            ))
+
+        if not valid_ips:
+            state.transcript.append(("warning", "alert", "No valid IPs to connect.", None))
+            state.mood = "sad"
+            state.mood_timer = 70
+            return
+
+        added = []
+        for ip in valid_ips:
+            if ip not in state.known_devices:
+                state.known_devices.append(ip)
+                added.append(ip)
+
+        state.known_devices = sorted(state.known_devices, key=lambda ip: tuple(int(o) for o in ip.split(".")))
+        save_known_devices(state.known_devices)
+
+        if added:
+            state.transcript.append((
+                "ok",
+                "ok",
+                f"Connected device(s) added: {', '.join(added)}",
+                None,
+            ))
+        else:
+            state.transcript.append((
+                "system",
+                "info",
+                "All provided devices were already connected.",
+                None,
+            ))
+
+        state.transcript.append((
+            "system",
+            "devices",
+            f"Known devices: {', '.join(state.known_devices)}",
+            None,
+        ))
+        state.mood = "happy"
+        state.mood_timer = 90
+    elif cmd_lower == "/devices":
+        if state.known_devices:
+            state.transcript.append((
+                "mochi",
+                "Mochi",
+                f"Connected devices: {', '.join(state.known_devices)}",
+                None,
+            ))
+            state.mood = "happy"
+        else:
+            state.transcript.append((
+                "warning",
+                "alert",
+                "No connected devices yet. Use /connect <ip> first.",
+                None,
+            ))
+            state.mood = "sad"
+        state.mood_timer = 80
+    elif cmd_lower.startswith("/agents"):
+        parts = cmd.split(maxsplit=1)
+        target_devices = state.known_devices[:]
+
+        if len(parts) > 1:
+            valid_ips, invalid_ips = parse_ip_list(parts[1])
+            if invalid_ips:
+                state.transcript.append((
+                    "warning",
+                    "alert",
+                    f"Invalid IP(s): {', '.join(invalid_ips)}",
+                    None,
+                ))
+
+            if valid_ips:
+                target_devices = valid_ips
+
+                # Convenience: inline /agents IPs are remembered as known devices.
+                changed = False
+                for ip in valid_ips:
+                    if ip not in state.known_devices:
+                        state.known_devices.append(ip)
+                        changed = True
+                if changed:
+                    state.known_devices = sorted(
+                        state.known_devices,
+                        key=lambda ip: tuple(int(o) for o in ip.split(".")),
+                    )
+                    save_known_devices(state.known_devices)
+
+        if not target_devices:
+            state.transcript.append((
+                "warning",
+                "alert",
+                "No connected devices. Use /connect <ip> or /agents <ip>.",
+                None,
+            ))
+            state.mood = "sad"
+            state.mood_timer = 80
+            return
+
+        combined_agents = []
+        reachable = 0
+        for ip in target_devices:
+            payload, err = fetch_device_status(ip)
+            if err:
+                state.transcript.append((
+                    "warning",
+                    "alert",
+                    f"{ip}: failed to fetch /status ({err})",
+                    None,
+                ))
+                continue
+
+            reachable += 1
+
+            cpu_usage = _safe_float(payload.get("cpu_usage", 0.0), 0.0)
+            mem_usage = _safe_float(payload.get("mem_usage", 0.0), 0.0)
+            temp = _safe_float(payload.get("temp", 0.0), 0.0)
+            agent_count = len(payload.get("agents", [])) if isinstance(payload.get("agents", []), list) else 0
+            state.transcript.append((
+                "system",
+                "status",
+                f"{ip}: cpu={cpu_usage:.1f}% mem={mem_usage:.1f}% temp={temp:.1f}C agents={agent_count}",
+                None,
+            ))
+
+            combined_agents.extend(build_roster_from_status(ip, payload))
+
+        if combined_agents:
+            state.transcript.append((
+                "mochi",
+                "Mochi",
+                f"Live agents from {reachable}/{len(target_devices)} device(s):",
+                {"type": "roster", "agents": combined_agents},
+            ))
+            state.mood = "thinking"
+            state.mood_timer = 100
+        else:
+            state.transcript.append((
+                "warning",
+                "alert",
+                "No agent data received from connected devices.",
+                None,
+            ))
+            state.mood = "sad"
+            state.mood_timer = 90
     elif cmd_lower.startswith("/inspect"):
         parts = cmd.split(maxsplit=1)
         if len(parts) > 1:
@@ -978,6 +2054,74 @@ def handle_command(state: AppState, cmd: str) -> None:
         state.transcript.append(("mochi", "Mochi", "Dashboard shows charts and trends!",
                                   {"type": "dashboard"}))
         state.mood = "happy"; state.mood_timer = 60
+    elif cmd_lower == "/level":
+        state.transcript.append((
+            "mochi",
+            "Mochi",
+            (
+                f"Level {state.eco_level} | flower={state.flower_stage} | "
+                f"co2={state.latest_co2_kg:.4f}kg | tokens={state.latest_tokens} | source={state.latest_signal_source}"
+            ),
+            None,
+        ))
+        state.mood = "thinking"
+        state.mood_timer = 70
+    elif cmd_lower == "/flower":
+        import webbrowser
+
+        state.transcript.append(("mochi", "Mochi", "Opening flower level preview...", None))
+        try:
+            flower_page = Path(__file__).with_name("flower.html").resolve()
+            webbrowser.open(flower_page.as_uri())
+            state.transcript.append((
+                "system",
+                "flower",
+                f"Flower stage={state.flower_stage} (level {state.eco_level}) | source={state.latest_signal_source}",
+                None,
+            ))
+            state.mood = "happy"
+        except Exception as exc:
+            state.transcript.append(("warning", "alert", f"Could not open flower page: {exc}", None))
+            state.mood = "sad"
+        state.mood_timer = 70
+    elif cmd_lower == "/health":
+        report = build_health_report(state)
+        state.transcript.append((
+            "mochi",
+            "Mochi",
+            (
+                "Pipeline health: "
+                f"prompt_log={report['prompt_log_exists']} age={_safe_float(report['prompt_log_age_s']):.1f}s | "
+                f"snapshot={report['usage_snapshot_exists']} age={_safe_float(report['usage_snapshot_age_s']):.1f}s | "
+                f"workers emission={report['emission_poll_inflight']} llm={report['llm_inflight']} optimize={report['optimize_workflow_inflight']} | "
+                f"devices {report['devices_reachable']}/{report['devices_configured']} reachable | "
+                f"influx={report['influx_heartbeat_status']} age={_safe_float(report['influx_heartbeat_age_s']):.1f}s "
+                f"points={report['influx_points_written']} validated={report['influx_valid_measurements']}"
+            ),
+            None,
+        ))
+        state.transcript.append((
+            "system",
+            "health",
+            (
+                f"Optimize workflow: status={report['optimize_workflow_status']} "
+                f"last_run_age={_safe_float(report['optimize_workflow_last_run_age_s']):.1f}s "
+                f"error={report['optimize_workflow_error'] or 'none'}"
+            ),
+            None,
+        ))
+        state.transcript.append((
+            "system",
+            "health",
+            (
+                f"Flower signal: stage={state.flower_stage} level={state.eco_level} | "
+                f"co2={state.latest_co2_kg:.4f}kg + prompt_saved_60m={state.prompt_tokens_saved_recent} tok "
+                f"({state.prompt_carbon_saved_recent_g:.4f}g)"
+            ),
+            None,
+        ))
+        state.mood = "thinking"
+        state.mood_timer = 90
     elif cmd_lower == "/replay":
         state.transcript.append(("mochi", "Mochi", "Replaying last optimization event...", None))
         state.mood = "celebrate"; state.mood_timer = 120
@@ -1043,6 +2187,7 @@ Focus: agents, tokens, performance, optimization."""
         last_system_prompt=state.last_system_prompt_sent,
         source="tamagochi.app",
     )
+    optimized_prompt = optimization.optimized_prompt.strip() or text.strip()
     if optimization.events:
         kinds = ", ".join(e.optimization_type for e in optimization.events)
         total_saved = sum(e.tokens_saved for e in optimization.events)
@@ -1055,43 +2200,28 @@ Focus: agents, tokens, performance, optimization."""
 
     # Add context
     agent_context = f"\n\nCurrent agents: {', '.join(a['name'] for a in MOCK_AGENTS)}"
-    full_prompt = optimization.optimized_prompt + agent_context
+    full_prompt = optimized_prompt + agent_context
     
     # Show thinking state
     state.mood = "thinking"
     state.mood_timer = 30
     
-    # Call Ollama/Gemma3
-    response = call_ollama(
-        state.model_name,
-        full_prompt,
-        optimization.optimized_system_prompt or None,
+    state.transcript.append(("system", "[llm]", "Processing in background...", None))
+    start_llm_request(
+        state,
+        optimized_prompt=full_prompt,
+        optimized_system_prompt=optimization.optimized_system_prompt,
         max_tokens=optimization.max_tokens,
+        system_prompt=system_prompt,
     )
-    state.last_system_prompt_sent = system_prompt
-    
-    # Add response to transcript
-    state.transcript.append(("mochi", "Mochii", response, None))
-    
-    # Set mood based on response sentiment
-    if any(word in response.lower() for word in ["great", "excellent", "perfect", "good", "nice", "optimized", "efficient"]):
-        state.mood = "happy"
-        state.mood_timer = 90
-    elif any(word in response.lower() for word in ["warning", "hot", "high", "issue", "problem", "concern"]):
-        state.mood = "warning"
-        state.mood_timer = 100
-    elif any(word in response.lower() for word in ["success", "improved", "reduced", "saved"]):
-        state.mood = "celebrate"
-        state.mood_timer = 90
-    else:
-        state.mood = "idle"
-        state.mood_timer = 60
 
 
 def handle_input(state: AppState, text: str) -> None:
     state.transcript.append(("user", ">", text, None))
     if text.startswith("/"):
         handle_command(state, text)
+    elif normalize_ipv4(text.strip()):
+        handle_command(state, f"/connect {text.strip()}")
     else:
         handle_natural_language(state, text)
 
@@ -1139,6 +2269,7 @@ class KeyReader:
 
 def main() -> None:
     state = AppState()
+    state.known_devices = load_known_devices()
 
     import signal
     def handle_resize(signum, frame):
@@ -1149,6 +2280,12 @@ def main() -> None:
     state.transcript.append(("system", "[system]", "Terminal session started.", None))
     state.transcript.append(("system", "[system]",
                               f"Dashboard: {DASHBOARD_URL} (use /dashboard to start)", None))
+    if state.known_devices:
+        state.transcript.append(("system", "[system]",
+                                  f"Connected devices: {', '.join(state.known_devices)}", None))
+    else:
+        state.transcript.append(("system", "[system]",
+                                  "No connected devices. Use /connect <ip> to add one.", None))
 
     tick_interval = 0.033   # ~30 fps
     last_render   = 0.0
@@ -1178,17 +2315,22 @@ def main() -> None:
                     if state.mood_timer == 0:
                         state.mood = "idle"
 
+                process_background_events(state)
+
+                if now >= state.next_emission_refresh:
+                    start_emission_poll(state)
+                    state.next_emission_refresh = now + EMISSION_REFRESH_INTERVAL_S
+
                 # Auto-optimize when emissions cross threshold.
                 if now >= state.next_auto_optimize_check and now >= state.auto_optimize_cooldown_until:
                     state.next_auto_optimize_check = now + AUTO_OPTIMIZE_INTERVAL_S
-                    co2_kg, total_tokens, source = get_latest_copilot_emission_kg()
-                    if source != "none" and co2_kg >= CO2_THRESHOLD_KG:
+                    if state.latest_signal_source != "none" and state.latest_co2_kg >= CO2_THRESHOLD_KG:
                         trigger_optimize(state)
                         state.auto_optimize_cooldown_until = now + AUTO_OPTIMIZE_COOLDOWN_S
                         state.transcript.append((
                             "warning",
                             "optimize",
-                            f"Auto optimize triggered: CO2={co2_kg:.3f}kg (tokens={total_tokens}) >= {CO2_THRESHOLD_KG:.3f}kg.",
+                            f"Auto optimize triggered: CO2={state.latest_co2_kg:.3f}kg (tokens={state.latest_tokens}) >= {CO2_THRESHOLD_KG:.3f}kg.",
                             None,
                         ))
 
@@ -1204,7 +2346,10 @@ def main() -> None:
                         trigger_walk(state)
 
                     elif key.lower() == "p" and not state.input_buffer:
-                        trigger_party(state)
+                        trigger_carbon_plan(state)
+
+                    elif key.lower() == "f" and not state.input_buffer:
+                        trigger_feed_carbonmin(state)
 
                     elif key.lower() == "n" and not state.input_buffer:
                         trigger_nap(state)

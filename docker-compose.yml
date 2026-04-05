@@ -1,4 +1,31 @@
 services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.8
+    container_name: hackathon-redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - "1G"
+      - --reserve-memory
+      - "0M"
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://localhost:9092
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    networks:
+      - hackathon-network
+
   influxdb:
     image: influxdb:2.7
     container_name: hackathon-influxdb

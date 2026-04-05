@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flower Pixel Art</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #111;
+      overflow: hidden;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+    }
+
+    .stage {
+      position: relative;
+      display: grid;
+      place-items: center;
+      gap: 18px;
+      padding: 24px;
+    }
+
+    .hud {
+      text-align: center;
+      color: #f3f3f3;
+      letter-spacing: 0.06em;
+    }
+
+    .level-tag {
+      display: inline-block;
+      padding: 6px 10px;
+      border: 1px solid #333;
+      border-radius: 999px;
+      font-size: 12px;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+      background: rgba(255, 255, 255, 0.06);
+    }
+
+    .hint {
+      margin: 0;
+      font-size: 14px;
+      color: #c9c9c9;
+    }
+
+    .pixelart-to-css {
+      box-shadow: 90px 30px 0 0 rgba(255, 255, 255, 1), 100px 30px 0 0 rgba(255, 255, 255, 1), 80px 40px 0 0 rgba(255, 255, 255, 1), 90px 40px 0 0 rgba(255, 255, 255, 1), 100px 40px 0 0 rgba(255, 255, 255, 1), 110px 40px 0 0 rgba(255, 255, 255, 1), 70px 50px 0 0 rgba(255, 255, 255, 1), 80px 50px 0 0 rgba(255, 255, 255, 1), 90px 50px 0 0 rgba(255, 255, 255, 1), 100px 50px 0 0 rgba(255, 255, 255, 1), 110px 50px 0 0 rgba(255, 255, 255, 1), 120px 50px 0 0 rgba(255, 255, 255, 1), 60px 60px 0 0 rgba(255, 255, 255, 1), 70px 60px 0 0 rgba(255, 255, 255, 1), 80px 60px 0 0 rgba(255, 255, 255, 1), 90px 60px 0 0 rgba(255, 152, 0, 1), 100px 60px 0 0 rgba(255, 152, 0, 1), 110px 60px 0 0 rgba(255, 255, 255, 1), 120px 60px 0 0 rgba(255, 255, 255, 1), 130px 60px 0 0 rgba(255, 255, 255, 1), 60px 70px 0 0 rgba(255, 255, 255, 1), 70px 70px 0 0 rgba(255, 255, 255, 1), 80px 70px 0 0 rgba(255, 255, 255, 1), 90px 70px 0 0 rgba(255, 152, 0, 1), 100px 70px 0 0 rgba(255, 152, 0, 1), 110px 70px 0 0 rgba(255, 255, 255, 1), 120px 70px 0 0 rgba(255, 255, 255, 1), 130px 70px 0 0 rgba(255, 255, 255, 1), 70px 80px 0 0 rgba(255, 255, 255, 1), 80px 80px 0 0 rgba(255, 255, 255, 1), 90px 80px 0 0 rgba(255, 255, 255, 1), 100px 80px 0 0 rgba(255, 255, 255, 1), 110px 80px 0 0 rgba(255, 255, 255, 1), 120px 80px 0 0 rgba(255, 255, 255, 1), 80px 90px 0 0 rgba(255, 255, 255, 1), 90px 90px 0 0 rgba(255, 255, 255, 1), 100px 90px 0 0 rgba(255, 255, 255, 1), 110px 90px 0 0 rgba(255, 255, 255, 1), 40px 100px 0 0 rgba(139, 195, 74, 1), 50px 100px 0 0 rgba(139, 195, 74, 1), 90px 100px 0 0 rgba(255, 255, 255, 1), 100px 100px 0 0 rgba(255, 255, 255, 1), 140px 100px 0 0 rgba(139, 195, 74, 1), 150px 100px 0 0 rgba(139, 195, 74, 1), 50px 110px 0 0 rgba(139, 195, 74, 1), 60px 110px 0 0 rgba(139, 195, 74, 1), 90px 110px 0 0 rgba(76, 175, 80, 1), 100px 110px 0 0 rgba(76, 175, 80, 1), 130px 110px 0 0 rgba(139, 195, 74, 1), 140px 110px 0 0 rgba(139, 195, 74, 1), 60px 120px 0 0 rgba(139, 195, 74, 1), 70px 120px 0 0 rgba(139, 195, 74, 1), 90px 120px 0 0 rgba(76, 175, 80, 1), 100px 120px 0 0 rgba(76, 175, 80, 1), 120px 120px 0 0 rgba(139, 195, 74, 1), 130px 120px 0 0 rgba(139, 195, 74, 1), 70px 130px 0 0 rgba(139, 195, 74, 1), 80px 130px 0 0 rgba(139, 195, 74, 1), 90px 130px 0 0 rgba(139, 195, 74, 1), 100px 130px 0 0 rgba(76, 175, 80, 1), 110px 130px 0 0 rgba(139, 195, 74, 1), 120px 130px 0 0 rgba(139, 195, 74, 1), 80px 140px 0 0 rgba(139, 195, 74, 1), 90px 140px 0 0 rgba(139, 195, 74, 1), 100px 140px 0 0 rgba(139, 195, 74, 1), 110px 140px 0 0 rgba(139, 195, 74, 1), 50px 150px 0 0 rgba(255, 152, 0, 1), 60px 150px 0 0 rgba(255, 152, 0, 1), 70px 150px 0 0 rgba(255, 152, 0, 1), 80px 150px 0 0 rgba(255, 152, 0, 1), 90px 150px 0 0 rgba(255, 152, 0, 1), 100px 150px 0 0 rgba(255, 152, 0, 1), 110px 150px 0 0 rgba(255, 152, 0, 1), 120px 150px 0 0 rgba(255, 152, 0, 1), 130px 150px 0 0 rgba(255, 152, 0, 1), 140px 150px 0 0 rgba(255, 152, 0, 1), 150px 150px 0 0 rgba(255, 152, 0, 1), 70px 160px 0 0 rgba(121, 85, 72, 1), 80px 160px 0 0 rgba(255, 152, 0, 1), 90px 160px 0 0 rgba(121, 85, 72, 1), 100px 160px 0 0 rgba(121, 85, 72, 1), 110px 160px 0 0 rgba(121, 85, 72, 1), 120px 160px 0 0 rgba(121, 85, 72, 1), 70px 170px 0 0 rgba(121, 85, 72, 1), 80px 170px 0 0 rgba(121, 85, 72, 1), 90px 170px 0 0 rgba(121, 85, 72, 1), 100px 170px 0 0 rgba(255, 152, 0, 1), 110px 170px 0 0 rgba(121, 85, 72, 1), 120px 170px 0 0 rgba(121, 85, 72, 1), 70px 180px 0 0 rgba(121, 85, 72, 1), 80px 180px 0 0 rgba(255, 152, 0, 1), 90px 180px 0 0 rgba(121, 85, 72, 1), 100px 180px 0 0 rgba(255, 152, 0, 1), 110px 180px 0 0 rgba(121, 85, 72, 1), 120px 180px 0 0 rgba(121, 85, 72, 1), 70px 190px 0 0 rgba(121, 85, 72, 1), 80px 190px 0 0 rgba(121, 85, 72, 1), 90px 190px 0 0 rgba(121, 85, 72, 1), 100px 190px 0 0 rgba(121, 85, 72, 1), 110px 190px 0 0 rgba(121, 85, 72, 1), 120px 190px 0 0 rgba(121, 85, 72, 1);
+      height: 10px;
+      width: 10px;
+      transform-origin: center;
+      transition: filter 240ms ease;
+    }
+
+    .pixelart-to-css.implode {
+      animation: implode 780ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+      filter: blur(1px);
+    }
+
+    @keyframes implode {
+      0% {
+        transform: translateY(0) scale(1) rotate(0deg);
+        opacity: 1;
+      }
+      55% {
+        transform: translateY(8px) scale(0.82) rotate(-8deg);
+        opacity: 0.9;
+      }
+      100% {
+        transform: translateY(26px) scale(0.02) rotate(-28deg);
+        opacity: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="stage" aria-live="polite">
+    <section class="hud">
+      <div class="level-tag" id="levelTag">Level 1: Flower</div>
+      <p class="hint" id="hintText">Press A for Level 2</p>
+    </section>
+    <div class="pixelart-to-css" id="flowerSprite" aria-label="flower pixel art"></div>
+  </main>
+
+  <script>
+    const flowerSprite = document.getElementById("flowerSprite");
+    const levelTag = document.getElementById("levelTag");
+    const hintText = document.getElementById("hintText");
+    let switchedToLevel2 = false;
+
+    function goToLevel2() {
+      if (switchedToLevel2) {
+        return;
+      }
+      switchedToLevel2 = true;
+
+      levelTag.textContent = "Level 2: Cat";
+      hintText.textContent = "Flower imploding...";
+      flowerSprite.classList.add("implode");
+
+      window.setTimeout(() => {
+        window.location.href = "cat.html";
+      }, 800);
+    }
+
+    window.addEventListener("keydown", (event) => {
+      if (event.key.toLowerCase() === "a") {
+        goToLevel2();
+      }
+    });
+  </script>
+</body>
+</html>

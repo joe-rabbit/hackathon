@@ -21,6 +21,9 @@ DEFAULT_LOG_PATH = (
 DEFAULT_PROMPT_EFFICIENCY_LOG_PATH = (
     Path(__file__).resolve().parent.parent / "logs" / "prompt_efficiency_log.jsonl"
 )
+DEFAULT_INGEST_HEARTBEAT_PATH = (
+    Path(__file__).resolve().parent.parent / "logs" / "influx_ingest_heartbeat.json"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +68,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="In watch mode, ingest existing lines first before tailing new lines.",
     )
+    parser.add_argument(
+        "--heartbeat-file",
+        type=Path,
+        default=DEFAULT_INGEST_HEARTBEAT_PATH,
+        help="JSON status file updated after successful ingest.",
+    )
+    parser.add_argument(
+        "--validate-measurements",
+        action="store_true",
+        help="After ingest, query Influx to confirm key measurements are readable.",
+    )
     return parser.parse_args()
 
 
@@ -89,6 +103,21 @@ def safe_float(value: Any) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+def escape_field_string(value: str) -> str:
+    """Escape string field values for Influx line protocol."""
+    text = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return text
+
+
+def compact_text(value: Any, limit: int = 700) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
 
 
 def build_lines(record: dict[str, Any], kg_per_kwh: float) -> list[str]:
@@ -210,7 +239,7 @@ def build_prompt_efficiency_lines(record: dict[str, Any]) -> list[str]:
     carbon_saved_g = safe_float(record.get("carbon_saved_g"))
     max_tokens_before = safe_int(record.get("max_tokens_before"))
     max_tokens_after = safe_int(record.get("max_tokens_after"))
-    return [
+    lines = [
         "prompt_efficiency"
         f",optimization_type={escape_tag(optimization_type)},"
         f"task_type={escape_tag(task_type)},source={escape_tag(source)}"
@@ -218,6 +247,22 @@ def build_prompt_efficiency_lines(record: dict[str, Any]) -> list[str]:
         f"tokens_saved={tokens_saved}i,carbon_saved_g={carbon_saved_g},"
         f"max_tokens_before={max_tokens_before}i,max_tokens_after={max_tokens_after}i {ts_ns}"
     ]
+
+    # Keep textual before/after prompts for Chronograf/Influx table inspection.
+    original_prompt = compact_text(record.get("original_prompt"), limit=700)
+    optimized_prompt = compact_text(record.get("optimized_prompt"), limit=700)
+    if original_prompt or optimized_prompt:
+        lines.append(
+            "prompt_efficiency_samples"
+            f",optimization_type={escape_tag(optimization_type)},"
+            f"task_type={escape_tag(task_type)},source={escape_tag(source)}"
+            f" original_prompt=\"{escape_field_string(original_prompt)}\","
+            f"optimized_prompt=\"{escape_field_string(optimized_prompt)}\","
+            f"original_tokens={original_tokens}i,optimized_tokens={optimized_tokens}i,"
+            f"tokens_saved={tokens_saved}i,carbon_saved_g={carbon_saved_g} {ts_ns}"
+        )
+
+    return lines
 
 
 def read_jsonl(path: Path, since_lines: int) -> list[dict[str, Any]]:
@@ -292,6 +337,76 @@ def write_to_influx(url: str, org: str, bucket: str, token: str, body: str) -> N
     with request.urlopen(req, timeout=30) as resp:
         if resp.status not in (204, 200):
             raise RuntimeError(f"Influx write failed: HTTP {resp.status}")
+
+
+def write_heartbeat(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def query_influx_csv(url: str, org: str, token: str, flux: str) -> str:
+    endpoint = f"{url.rstrip('/')}/api/v2/query?" + parse.urlencode({"org": org})
+    req = request.Request(
+        endpoint,
+        data=flux.encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Token {token}",
+            "Content-Type": "application/vnd.flux",
+            "Accept": "application/csv",
+        },
+    )
+    with request.urlopen(req, timeout=30) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def measurement_has_recent_data(
+    url: str,
+    org: str,
+    bucket: str,
+    token: str,
+    measurement: str,
+    window: str = "-7d",
+) -> bool:
+    flux = (
+        f'from(bucket: "{bucket}") '
+        f'|> range(start: {window}) '
+        f'|> filter(fn: (r) => r._measurement == "{measurement}") '
+        "|> limit(n: 1)"
+    )
+    csv_body = query_influx_csv(url, org, token, flux)
+    for line in csv_body.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        if ",result,table," in line:
+            return True
+    return False
+
+
+def validate_measurements(
+    url: str,
+    org: str,
+    bucket: str,
+    token: str,
+) -> dict[str, bool]:
+    checks = {}
+    for measurement in (
+        "copilot_totals",
+        "copilot_model_totals",
+        "prompt_optimization",
+        "prompt_efficiency",
+    ):
+        try:
+            checks[measurement] = measurement_has_recent_data(
+                url=url,
+                org=org,
+                bucket=bucket,
+                token=token,
+                measurement=measurement,
+            )
+        except Exception:
+            checks[measurement] = False
+    return checks
 
 
 def ingest_records(
@@ -402,6 +517,30 @@ def run_watch(args: argparse.Namespace) -> int:
                 )
             )
             if ingested_points > 0 or prompt_ingested_points > 0:
+                validation: dict[str, bool] | None = None
+                if args.validate_measurements:
+                    validation = validate_measurements(
+                        url=args.influx_url,
+                        org=args.org,
+                        bucket=args.bucket,
+                        token=args.token,
+                    )
+
+                heartbeat_payload: dict[str, Any] = {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "status": "ok",
+                    "mode": "watch",
+                    "snapshots_ingested": ingested_records,
+                    "prompt_efficiency_records_ingested": prompt_ingested_records,
+                    "points_written": ingested_points + prompt_ingested_points,
+                    "influx_url": args.influx_url,
+                    "org": args.org,
+                    "bucket": args.bucket,
+                }
+                if validation is not None:
+                    heartbeat_payload["validation"] = validation
+                write_heartbeat(args.heartbeat_file, heartbeat_payload)
+
                 print(
                     f"[{time.strftime('%H:%M:%S')}] Ingested {ingested_records} snapshots and "
                     f"{prompt_ingested_records} prompt-efficiency records as "
@@ -488,10 +627,37 @@ def main() -> int:
         print("No valid points generated from snapshots.")
         return 1
 
+    validation: dict[str, bool] | None = None
+    if args.validate_measurements:
+        validation = validate_measurements(
+            url=args.influx_url,
+            org=args.org,
+            bucket=args.bucket,
+            token=args.token,
+        )
+
+    heartbeat_payload: dict[str, Any] = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "status": "ok",
+        "mode": "oneshot",
+        "snapshots_ingested": ingested_records,
+        "prompt_efficiency_records_ingested": prompt_ingested_records,
+        "points_written": ingested_points + prompt_ingested_points,
+        "influx_url": args.influx_url,
+        "org": args.org,
+        "bucket": args.bucket,
+    }
+    if validation is not None:
+        heartbeat_payload["validation"] = validation
+    write_heartbeat(args.heartbeat_file, heartbeat_payload)
+
     print(
         f"Ingested {ingested_records} snapshots and {prompt_ingested_records} prompt-efficiency "
         f"records as {ingested_points + prompt_ingested_points} points into InfluxDB."
     )
+    if validation is not None:
+        ok = sum(1 for v in validation.values() if v)
+        print(f"Validation: {ok}/{len(validation)} measurements returned data.")
     return 0
 
 

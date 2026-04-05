@@ -205,3 +205,44 @@ from(bucket: "metrics")
   |> filter(fn: (r) => r._measurement == "prompt_efficiency" and r._field == "carbon_saved_g")
   |> aggregateWindow(every: 5m, fn: sum, createEmpty: false)
 ```
+
+## 18) Prompt Original vs Optimized (latest samples)
+
+Visualization: Table
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_efficiency_samples")
+  |> filter(fn: (r) => r._field == "original_prompt" or r._field == "optimized_prompt")
+  |> pivot(rowKey: ["_time", "optimization_type", "task_type", "source"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"], desc: true)
+  |> limit(n: 50)
+```
+
+## 19) Prompt Compression Delta (latest samples)
+
+Visualization: Table or Bar
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_efficiency_samples")
+  |> filter(fn: (r) => r._field == "original_tokens" or r._field == "optimized_tokens" or r._field == "tokens_saved")
+  |> pivot(rowKey: ["_time", "optimization_type", "task_type", "source"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"], desc: true)
+  |> limit(n: 100)
+```
+
+## 20) Most Effective Optimization Type by Avg Tokens Saved
+
+Visualization: Bar
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_efficiency_samples" and r._field == "tokens_saved")
+  |> group(columns: ["optimization_type"])
+  |> mean()
+  |> sort(columns: ["_value"], desc: true)
+```

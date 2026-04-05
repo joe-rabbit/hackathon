@@ -1,4 +1,4 @@
-# 🍡 Mochi - Edge AI Orchestrator UI
+# hackathon
 
 An interactive terminal companion and dashboard for monitoring and optimizing AI agents running on edge devices. Mochi explains what the orchestrator does in plain English while providing real-time visibility into agent performance.
 

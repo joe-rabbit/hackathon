@@ -1,1 +1,2 @@
-# No extra dashboard dependencies required for InfluxDB-only setup.
+# Async Kafka stream ingestion support.
+aiokafka>=0.10.0
