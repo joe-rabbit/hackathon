@@ -14,8 +14,9 @@ import time
 from typing import Any
 from urllib import parse, request
 
+# Repo root = parent of dashboard/ (not parents[2], which is one level too high).
 DEFAULT_LOG_PATH = (
-    Path(__file__).resolve().parents[2] / "logs" / "copilot_usage_log.jsonl"
+    Path(__file__).resolve().parent.parent / "logs" / "copilot_usage_log.jsonl"
 )
 
 
@@ -126,6 +127,46 @@ def build_lines(record: dict[str, Any], kg_per_kwh: float) -> list[str]:
                 f" tokens={model_tokens}i,requests={model_requests}i,"
                 f"kwh_estimate={model_kwh},kg_co2e={model_kg} {ts_ns}"
             )
+
+    sources = record.get("sources")
+    if isinstance(sources, dict) and total_tokens > 0:
+        for src_name, block in sources.items():
+            if not isinstance(block, dict) or not isinstance(src_name, str):
+                continue
+            tdata = block.get("totals")
+            if not isinstance(tdata, dict):
+                continue
+            st_tokens = safe_int(tdata.get("total_tokens"))
+            st_req = safe_int(tdata.get("requests"))
+            if st_tokens <= 0:
+                continue
+            share = st_tokens / total_tokens
+            st_kwh = kwh * share
+            st_kg = st_kwh * kg_per_kwh
+            lines.append(
+                "ai_usage_totals"
+                f",source={escape_tag(src_name)},"
+                f"energy_source={escape_tag(energy_source)},mode={escape_tag(mode)}"
+                f" total_tokens={st_tokens}i,requests={st_req}i,kwh={st_kwh},"
+                f"kg_co2e={st_kg} {ts_ns}"
+            )
+
+    po = record.get("prompt_optimization")
+    if isinstance(po, dict):
+        tier = str(po.get("tier", "laptop"))
+        opt_type = str(po.get("optimization_type", "prompt"))
+        tokens_o = safe_int(po.get("tokens_original_est"))
+        tokens_c = safe_int(po.get("tokens_compressed_est"))
+        tokens_saved = safe_int(po.get("tokens_saved"))
+        carbon_saved = safe_float(po.get("carbon_saved_g"))
+        eff = safe_float(po.get("efficiency_ratio"))
+        lines.append(
+            "prompt_optimization"
+            f",optimization_type={escape_tag(opt_type)},tier={escape_tag(tier)}"
+            f" tokens_original_est={tokens_o}i,tokens_compressed_est={tokens_c}i,"
+            f"tokens_saved={tokens_saved}i,carbon_saved_g={carbon_saved},"
+            f"efficiency_ratio={eff} {ts_ns}"
+        )
 
     return lines
 
@@ -271,14 +312,38 @@ def run_watch(args: argparse.Namespace) -> int:
         return 0
 
 
+def resolve_log_path(args: argparse.Namespace) -> Path:
+    """Prefer repo logs/; if missing, try ./logs from cwd (run analyzer from repo root)."""
+    primary = args.log_file.resolve()
+    if primary.exists():
+        return primary
+    using_default = args.log_file.resolve() == DEFAULT_LOG_PATH.resolve()
+    if using_default:
+        fallback = (Path.cwd() / "logs" / "copilot_usage_log.jsonl").resolve()
+        if fallback.exists():
+            return fallback
+    return primary
+
+
 def main() -> int:
     args = parse_args()
     if args.watch:
+        args.log_file = resolve_log_path(args)
         return run_watch(args)
 
-    records = read_jsonl(args.log_file, args.since_lines)
+    log_path = resolve_log_path(args)
+    records = read_jsonl(log_path, args.since_lines)
     if not records:
         print("No snapshot records found to ingest.")
+        print(f"  Expected file: {log_path}")
+        print(f"  Exists: {log_path.exists()}")
+        if log_path.exists():
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            nonempty = sum(1 for line in text.splitlines() if line.strip())
+            print(f"  Non-empty lines: {nonempty} (JSON parse may have failed)")
+        else:
+            print("  Run: python dashboard/agent_token_analyszer.py --log-dir logs")
+            print("  Or:  python dashboard/push_usage_to_influx.py --log-file logs/copilot_usage_log.jsonl")
         return 1
 
     ingested_records, ingested_points = ingest_records(

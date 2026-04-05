@@ -87,3 +87,76 @@ from(bucket: "metrics")
   |> sort(columns: ["_value"], desc: true)
   |> limit(n: 10)
 ```
+
+## 8) Usage by source (Copilot vs Claude)
+
+Visualization: Bar or Table
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "ai_usage_totals" and r._field == "total_tokens")
+  |> group(columns: ["source"])
+  |> last()
+```
+
+## 9) Prompt efficiency ratio (compressed / original)
+
+Visualization: Gauge or Single Stat (latest)
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_optimization" and r._field == "efficiency_ratio")
+  |> last()
+```
+
+## 10) g CO₂ saved by prompt compression (latest snapshot)
+
+Visualization: Single Stat
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_optimization" and r._field == "carbon_saved_g")
+  |> last()
+```
+
+## 11) Tokens saved over time (prompt-level optimization)
+
+Visualization: Line
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_optimization" and r._field == "tokens_saved")
+  |> aggregateWindow(every: 5m, fn: last, createEmpty: false)
+```
+
+## 12) Equivalent miles driven (from cumulative kg CO₂e — adjust multiplier in panel)
+
+Use **Script** or **custom cell**: multiply `kg_co2e` from `copilot_totals` by 1000 → g, then divide by ~400 g/mile. Or add a Transform in Grafana-style UI if available.
+
+Example (Flux — approximate miles from latest total CO₂e in kg):
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "copilot_totals" and r._field == "kg_co2e")
+  |> last()
+  |> map(fn: (r) => ({ r with _value: r._value * 1000.0 / 400.0 }))
+```
+
+Visualization: Single Stat (unit: miles equivalent)
+
+## 13) Trees per day equivalent (order-of-magnitude offset)
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "copilot_totals" and r._field == "kg_co2e")
+  |> last()
+  |> map(fn: (r) => ({ r with _value: r._value * 1000.0 / 55.0 }))
+```
+
+Assumes ~55 g CO₂e / tree / day rough offset; label panel “tree-days equivalent”.
