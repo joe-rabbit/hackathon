@@ -18,6 +18,9 @@ from urllib import parse, request
 DEFAULT_LOG_PATH = (
     Path(__file__).resolve().parent.parent / "logs" / "copilot_usage_log.jsonl"
 )
+DEFAULT_PROMPT_EFFICIENCY_LOG_PATH = (
+    Path(__file__).resolve().parent.parent / "logs" / "prompt_efficiency_log.jsonl"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +28,11 @@ def parse_args() -> argparse.Namespace:
         description="Push usage snapshots from JSONL into InfluxDB line protocol."
     )
     parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_PATH)
+    parser.add_argument(
+        "--prompt-efficiency-log-file",
+        type=Path,
+        default=DEFAULT_PROMPT_EFFICIENCY_LOG_PATH,
+    )
     parser.add_argument("--influx-url", default="http://localhost:8086")
     parser.add_argument("--org", default="hackathon")
     parser.add_argument("--bucket", default="metrics")
@@ -168,7 +176,48 @@ def build_lines(record: dict[str, Any], kg_per_kwh: float) -> list[str]:
             f"efficiency_ratio={eff} {ts_ns}"
         )
 
+    dedup = record.get("dedup")
+    if isinstance(dedup, dict):
+        status = str(dedup.get("status", "unknown"))
+        threshold = safe_float(dedup.get("threshold"))
+        pairs_found = safe_int(dedup.get("pairs_found"))
+        tokens_saved_total = safe_int(dedup.get("tokens_saved_if_cached_total"))
+        source_files_count = safe_int(dedup.get("source_files_count"))
+        max_similarity = safe_float(dedup.get("max_similarity_score"))
+        lines.append(
+            "prompt_dedup"
+            f",status={escape_tag(status)}"
+            f" pairs_found={pairs_found}i,"
+            f"tokens_saved_if_cached_total={tokens_saved_total}i,"
+            f"source_files_count={source_files_count}i,"
+            f"threshold={threshold},max_similarity_score={max_similarity} {ts_ns}"
+        )
+
     return lines
+
+
+def build_prompt_efficiency_lines(record: dict[str, Any]) -> list[str]:
+    timestamp_raw = record.get("timestamp")
+    if not isinstance(timestamp_raw, str):
+        return []
+    ts_ns = to_ns(timestamp_raw)
+    optimization_type = str(record.get("optimization_type", "unknown"))
+    task_type = str(record.get("task_type", "general"))
+    source = str(record.get("source", "unknown"))
+    original_tokens = safe_int(record.get("original_tokens"))
+    optimized_tokens = safe_int(record.get("optimized_tokens"))
+    tokens_saved = safe_int(record.get("tokens_saved"))
+    carbon_saved_g = safe_float(record.get("carbon_saved_g"))
+    max_tokens_before = safe_int(record.get("max_tokens_before"))
+    max_tokens_after = safe_int(record.get("max_tokens_after"))
+    return [
+        "prompt_efficiency"
+        f",optimization_type={escape_tag(optimization_type)},"
+        f"task_type={escape_tag(task_type)},source={escape_tag(source)}"
+        f" original_tokens={original_tokens}i,optimized_tokens={optimized_tokens}i,"
+        f"tokens_saved={tokens_saved}i,carbon_saved_g={carbon_saved_g},"
+        f"max_tokens_before={max_tokens_before}i,max_tokens_after={max_tokens_after}i {ts_ns}"
+    ]
 
 
 def read_jsonl(path: Path, since_lines: int) -> list[dict[str, Any]]:
@@ -267,9 +316,31 @@ def ingest_records(
     return len(records), len(lines)
 
 
+def ingest_prompt_efficiency_records(
+    records: list[dict[str, Any]],
+    influx_url: str,
+    org: str,
+    bucket: str,
+    token: str,
+) -> tuple[int, int]:
+    if not records:
+        return 0, 0
+
+    lines: list[str] = []
+    for record in records:
+        lines.extend(build_prompt_efficiency_lines(record))
+
+    if not lines:
+        return len(records), 0
+
+    write_to_influx(influx_url, org, bucket, token, "\n".join(lines))
+    return len(records), len(lines)
+
+
 def run_watch(args: argparse.Namespace) -> int:
     interval = max(args.interval, 0.2)
     offset = 0
+    prompt_offset = 0
 
     if args.watch_from_start:
         existing = read_jsonl(args.log_file, since_lines=0)
@@ -281,19 +352,38 @@ def run_watch(args: argparse.Namespace) -> int:
             args.token,
             args.grid_kg_co2e_per_kwh,
         )
+        prompt_existing = read_jsonl(args.prompt_efficiency_log_file, since_lines=0)
+        _, prompt_points = ingest_prompt_efficiency_records(
+            prompt_existing,
+            args.influx_url,
+            args.org,
+            args.bucket,
+            args.token,
+        )
         print(
-            f"Initial ingest complete: {ingested_records} snapshots, {ingested_points} points."
+            f"Initial ingest complete: {ingested_records} snapshots, {ingested_points + prompt_points} points."
         )
     elif args.log_file.exists():
         with args.log_file.open("r", encoding="utf-8", errors="replace") as f:
             f.seek(0, 2)
             offset = f.tell()
+    if args.prompt_efficiency_log_file.exists():
+        with args.prompt_efficiency_log_file.open(
+            "r", encoding="utf-8", errors="replace"
+        ) as f:
+            f.seek(0, 2)
+            prompt_offset = f.tell()
 
-    print(f"Watching {args.log_file} every {interval:.1f}s. Press Ctrl+C to stop.")
+    print(
+        f"Watching {args.log_file} and {args.prompt_efficiency_log_file} every {interval:.1f}s. Press Ctrl+C to stop."
+    )
 
     try:
         while True:
             records, offset = read_new_records(args.log_file, offset)
+            prompt_records, prompt_offset = read_new_records(
+                args.prompt_efficiency_log_file, prompt_offset
+            )
             ingested_records, ingested_points = ingest_records(
                 records,
                 args.influx_url,
@@ -302,9 +392,20 @@ def run_watch(args: argparse.Namespace) -> int:
                 args.token,
                 args.grid_kg_co2e_per_kwh,
             )
-            if ingested_points > 0:
+            prompt_ingested_records, prompt_ingested_points = (
+                ingest_prompt_efficiency_records(
+                    prompt_records,
+                    args.influx_url,
+                    args.org,
+                    args.bucket,
+                    args.token,
+                )
+            )
+            if ingested_points > 0 or prompt_ingested_points > 0:
                 print(
-                    f"[{time.strftime('%H:%M:%S')}] Ingested {ingested_records} snapshots as {ingested_points} points."
+                    f"[{time.strftime('%H:%M:%S')}] Ingested {ingested_records} snapshots and "
+                    f"{prompt_ingested_records} prompt-efficiency records as "
+                    f"{ingested_points + prompt_ingested_points} points."
                 )
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -325,15 +426,35 @@ def resolve_log_path(args: argparse.Namespace) -> Path:
     return primary
 
 
+def resolve_prompt_efficiency_log_path(args: argparse.Namespace) -> Path:
+    primary = args.prompt_efficiency_log_file.resolve()
+    if primary.exists():
+        return primary
+    using_default = (
+        args.prompt_efficiency_log_file.resolve()
+        == DEFAULT_PROMPT_EFFICIENCY_LOG_PATH.resolve()
+    )
+    if using_default:
+        fallback = (Path.cwd() / "logs" / "prompt_efficiency_log.jsonl").resolve()
+        if fallback.exists():
+            return fallback
+    return primary
+
+
 def main() -> int:
     args = parse_args()
+    args.prompt_efficiency_log_file = resolve_prompt_efficiency_log_path(args)
     if args.watch:
         args.log_file = resolve_log_path(args)
         return run_watch(args)
 
     log_path = resolve_log_path(args)
+    prompt_efficiency_log_path = resolve_prompt_efficiency_log_path(args)
     records = read_jsonl(log_path, args.since_lines)
-    if not records:
+    prompt_efficiency_records = read_jsonl(
+        prompt_efficiency_log_path, args.since_lines
+    )
+    if not records and not prompt_efficiency_records:
         print("No snapshot records found to ingest.")
         print(f"  Expected file: {log_path}")
         print(f"  Exists: {log_path.exists()}")
@@ -354,12 +475,22 @@ def main() -> int:
         args.token,
         args.grid_kg_co2e_per_kwh,
     )
-    if ingested_points == 0:
+    prompt_ingested_records, prompt_ingested_points = (
+        ingest_prompt_efficiency_records(
+            prompt_efficiency_records,
+            args.influx_url,
+            args.org,
+            args.bucket,
+            args.token,
+        )
+    )
+    if ingested_points == 0 and prompt_ingested_points == 0:
         print("No valid points generated from snapshots.")
         return 1
 
     print(
-        f"Ingested {ingested_records} snapshots as {ingested_points} points into InfluxDB."
+        f"Ingested {ingested_records} snapshots and {prompt_ingested_records} prompt-efficiency "
+        f"records as {ingested_points + prompt_ingested_points} points into InfluxDB."
     )
     return 0
 

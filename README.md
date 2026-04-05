@@ -300,3 +300,123 @@ MIT License - See LICENSE file
 ---
 
 Built with 💚 for the Hackathon | Powered by [Textual](https://textual.textualize.io/), [Streamlit](https://streamlit.io/), and [Ollama](https://ollama.ai/)
+
+## April 2026 Additions
+
+The current analytics flow adds prompt-efficiency and historical deduplication on top of the existing Mochi terminal + InfluxDB setup.
+
+### Current Dashboard Backend
+
+The active dashboard flow uses InfluxDB directly rather than a separate Streamlit app in this branch.
+
+- Influx UI: `http://localhost:8086`
+- Bucket: `metrics`
+- Flux query reference: `dashboard/influx_dashboard_queries.md`
+- Script-editor copy/paste cells: `dashboard/influx_script_builder.flux`
+
+### Prompt Optimization
+
+The app now intercepts natural-language prompts before they are sent to the model.
+
+- Entry point: `prompt_optimizer.py`
+- Gold rewrite map: `gold_prompts.json`
+- TUI integration: `tamagochi/app.py`
+- Event log: `logs/prompt_efficiency_log.jsonl`
+
+Optimizer behavior:
+
+- removes filler and politeness when safe
+- collapses redundant instructions
+- applies gold rewrites for known vague intents
+- deduplicates repeated system prompts across turns
+- sets task ceilings:
+  - classification: `50`
+  - summarization: `200`
+  - code generation: `500`
+
+Dry-run example:
+
+```bash
+python prompt_optimizer.py --prompt "can you help me write a python function that sorts a list" --dry-run
+```
+
+Normal run example:
+
+```bash
+python prompt_optimizer.py --prompt "can you help me write a python function that sorts a list"
+```
+
+When running normally, optimizer events are logged with:
+
+- `original_tokens`
+- `optimized_tokens`
+- `tokens_saved`
+- `carbon_saved_g`
+- `optimization_type`
+
+Those records are pushed into InfluxDB as the `prompt_efficiency` measurement.
+
+### Historical Prompt Deduplication
+
+The repository also includes a batch deduper for identifying repeated user prompts across exported chat logs.
+
+- Script: `dashboard/chat_dedup.py`
+- Input directory: `workspace_chat_logs/`
+- Output file: `logs/dedup_results.jsonl`
+
+Example:
+
+```bash
+python dashboard/chat_dedup.py
+```
+
+This writes cache-candidate pairs with:
+
+- `original_prompt`
+- `duplicate_prompt`
+- `similarity_score`
+- `tokens_saved_if_cached`
+- `source_files`
+
+Dedup is also integrated into `dashboard/agent_token_analyszer.py`, which now runs the deduper before writing each usage snapshot. The resulting snapshot includes a compact `dedup` summary, and `dashboard/push_usage_to_influx.py` ingests that summary into the `prompt_dedup` measurement.
+
+### Updated Analytics Workflow
+
+One-shot flow:
+
+```bash
+python dashboard/agent_token_analyszer.py --log-dir logs
+python dashboard/push_usage_to_influx.py \
+  --influx-url http://localhost:8086 \
+  --org hackathon \
+  --bucket metrics \
+  --token hackathon-dev-token
+```
+
+Watch flow:
+
+```bash
+python dashboard/agent_token_analyszer.py --log-dir logs --watch
+python dashboard/push_usage_to_influx.py \
+  --influx-url http://localhost:8086 \
+  --org hackathon \
+  --bucket metrics \
+  --token hackathon-dev-token \
+  --watch
+```
+
+The usage snapshot file `logs/copilot_usage_log.jsonl` now carries:
+
+- aggregated usage totals
+- per-source totals
+- prompt compression summary
+- dedup summary
+
+Influx measurements now include:
+
+- `copilot_totals`
+- `copilot_model_totals`
+- `ai_usage_totals`
+- `prompt_optimization`
+- `prompt_dedup`
+- `prompt_efficiency`

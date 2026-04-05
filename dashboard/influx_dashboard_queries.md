@@ -160,3 +160,48 @@ from(bucket: "metrics")
 ```
 
 Assumes ~55 g CO₂e / tree / day rough offset; label panel “tree-days equivalent”.
+
+## 14) Dedup cache candidates found (latest)
+
+Visualization: Single Stat
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_dedup" and r._field == "pairs_found")
+  |> last()
+```
+
+## 15) Tokens saved if duplicates were cached (latest)
+
+Visualization: Single Stat
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_dedup" and r._field == "tokens_saved_if_cached_total")
+  |> last()
+```
+
+## 16) Prompt-efficiency tokens saved by optimization type
+
+Visualization: Bar or Table
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_efficiency" and r._field == "tokens_saved")
+  |> group(columns: ["optimization_type"])
+  |> sum()
+```
+
+## 17) Prompt-efficiency carbon saved over time
+
+Visualization: Line
+
+```flux
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_efficiency" and r._field == "carbon_saved_g")
+  |> aggregateWindow(every: 5m, fn: sum, createEmpty: false)
+```

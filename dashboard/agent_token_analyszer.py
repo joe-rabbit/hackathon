@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -195,6 +196,29 @@ def parse_args() -> argparse.Namespace:
         default=400,
         help="Max user prompts to sample for compression stats (default: 400).",
     )
+    parser.add_argument(
+        "--skip-dedup",
+        action="store_true",
+        help="Skip historical prompt dedup analysis from ./workspace_chat_logs.",
+    )
+    parser.add_argument(
+        "--dedup-input-dir",
+        type=Path,
+        default=Path("workspace_chat_logs"),
+        help="Directory of exported chat logs for dedup analysis (default: ./workspace_chat_logs).",
+    )
+    parser.add_argument(
+        "--dedup-output",
+        type=Path,
+        default=Path("logs") / "dedup_results.jsonl",
+        help="Where dedup JSONL results are written (default: ./logs/dedup_results.jsonl).",
+    )
+    parser.add_argument(
+        "--dedup-threshold",
+        type=float,
+        default=0.85,
+        help="Similarity threshold for dedup candidates (default: 0.85).",
+    )
     return parser.parse_args()
 
 
@@ -370,6 +394,7 @@ def write_usage_snapshot(
     mode: str,
     sources_payload: dict[str, Any] | None = None,
     prompt_optimization: dict[str, Any] | None = None,
+    dedup_summary: dict[str, Any] | None = None,
 ) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     out_file = log_dir / "copilot_usage_log.jsonl"
@@ -421,6 +446,8 @@ def write_usage_snapshot(
         record["sources"] = sources_payload
     if prompt_optimization:
         record["prompt_optimization"] = prompt_optimization
+    if dedup_summary:
+        record["dedup"] = dedup_summary
     if hardware is not None:
         record["hardware"] = hardware
 
@@ -1096,6 +1123,130 @@ def _prompt_opt_payload(
     return out
 
 
+def summarize_dedup_output(
+    output_path: Path,
+    input_dir: Path,
+    threshold: float,
+    status: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    def _to_int(value: Any) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return 0
+
+    def _to_float(value: Any) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+
+    pairs_found = 0
+    tokens_saved_total = 0
+    max_similarity = 0.0
+    source_files: set[str] = set()
+
+    if output_path.exists():
+        try:
+            with output_path.open("r", encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        record = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    pairs_found += 1
+                    tokens_saved_total += _to_int(
+                        record.get("tokens_saved_if_cached")
+                    )
+                    max_similarity = max(
+                        max_similarity, _to_float(record.get("similarity_score"))
+                    )
+                    files = record.get("source_files")
+                    if isinstance(files, list):
+                        for item in files:
+                            if isinstance(item, str) and item.strip():
+                                source_files.add(item.strip())
+        except OSError as exc:
+            status = "error"
+            error = str(exc)
+
+    out: dict[str, Any] = {
+        "status": status,
+        "input_dir": str(input_dir),
+        "output_file": str(output_path),
+        "threshold": threshold,
+        "pairs_found": pairs_found,
+        "tokens_saved_if_cached_total": tokens_saved_total,
+        "source_files_count": len(source_files),
+        "max_similarity_score": round(max_similarity, 6),
+    }
+    if error:
+        out["error"] = error
+    return out
+
+
+def run_dedup_analysis(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.skip_dedup:
+        return None
+
+    input_dir = args.dedup_input_dir.resolve()
+    output_path = args.dedup_output.resolve()
+    script_path = Path(__file__).resolve().parent / "chat_dedup.py"
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--input-dir",
+        str(input_dir),
+        "--output",
+        str(output_path),
+        "--threshold",
+        str(args.dedup_threshold),
+    ]
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    stdout = proc.stdout.strip()
+    stderr = proc.stderr.strip()
+
+    if proc.returncode == 0:
+        if stdout:
+            print(stdout)
+        return summarize_dedup_output(
+            output_path=output_path,
+            input_dir=input_dir,
+            threshold=args.dedup_threshold,
+            status="ok",
+        )
+
+    if "No user prompts found under" in stdout:
+        print(stdout)
+        return summarize_dedup_output(
+            output_path=output_path,
+            input_dir=input_dir,
+            threshold=args.dedup_threshold,
+            status="no_input",
+        )
+
+    error = stderr or stdout or f"dedup exited with {proc.returncode}"
+    print(f"Dedup skipped/failed: {error}")
+    return summarize_dedup_output(
+        output_path=output_path,
+        input_dir=input_dir,
+        threshold=args.dedup_threshold,
+        status="error",
+        error=error,
+    )
+
+
 def stream_summary(args: argparse.Namespace) -> int:
     sources = parse_sources(args.sources)
     if "copilot" not in sources:
@@ -1177,6 +1328,7 @@ def stream_summary(args: argparse.Namespace) -> int:
                 model_summary = merge_dict_stats(
                     model_copilot, model_claude_static
                 )
+                dedup_summary = run_dedup_analysis(args)
                 print(f"[{time.strftime('%H:%M:%S')}] +{processed} request(s)")
                 print_summary(
                     summary,
@@ -1201,6 +1353,7 @@ def stream_summary(args: argparse.Namespace) -> int:
                     mode="watch",
                     sources_payload=sp if sp else None,
                     prompt_optimization=_prompt_opt_payload(args, user_prompt_samples),
+                    dedup_summary=dedup_summary,
                 )
                 print(f"Log snapshot appended to: {out_file}")
                 print()
@@ -1218,6 +1371,7 @@ def stream_summary(args: argparse.Namespace) -> int:
         )
         if hardware is not None:
             print_hardware_estimate(args.hardware_profile, hardware)
+        dedup_summary = run_dedup_analysis(args)
         sp = build_sources_payload(
             summary_copilot if summary_copilot else None,
             summary_claude_static if summary_claude_static else None,
@@ -1233,6 +1387,7 @@ def stream_summary(args: argparse.Namespace) -> int:
             mode="watch-stop",
             sources_payload=sp if sp else None,
             prompt_optimization=_prompt_opt_payload(args, user_prompt_samples),
+            dedup_summary=dedup_summary,
         )
         print(f"Log snapshot appended to: {out_file}")
         return 0
@@ -1359,6 +1514,7 @@ def main() -> int:
         summary_claude if summary_claude else None,
     )
     prompt_opt = _prompt_opt_payload(args, user_prompt_samples)
+    dedup_summary = run_dedup_analysis(args)
 
     print_summary(
         summary,
@@ -1379,6 +1535,7 @@ def main() -> int:
         mode="oneshot",
         sources_payload=sp if sp else None,
         prompt_optimization=prompt_opt,
+        dedup_summary=dedup_summary,
     )
     print(f"Log snapshot appended to: {out_file}")
     return 0

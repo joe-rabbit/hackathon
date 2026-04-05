@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
 
+from prompt_optimizer import optimize_prompt
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLOR PALETTE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -173,6 +175,7 @@ class AppState:
     walk_direction: int = 1  # 1 for right, -1 for left
     next_auto_optimize_check: float = 0.0
     auto_optimize_cooldown_until: float = 0.0
+    last_system_prompt_sent: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -987,7 +990,12 @@ def handle_command(state: AppState, cmd: str) -> None:
         state.mood = "thinking"; state.mood_timer = 60
 
 
-def call_ollama(model: str, prompt: str, system_prompt: str = None) -> str:
+def call_ollama(
+    model: str,
+    prompt: str,
+    system_prompt: str = None,
+    max_tokens: int | None = None,
+) -> str:
     """Call Ollama API to get LLM response."""
     try:
         ollama_base_url = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
@@ -999,6 +1007,8 @@ def call_ollama(model: str, prompt: str, system_prompt: str = None) -> str:
         }
         if system_prompt:
             data["system"] = system_prompt
+        if max_tokens is not None:
+            data["options"] = {"num_predict": int(max_tokens)}
         
         req = urllib.request.Request(
             url,
@@ -1027,16 +1037,38 @@ No fluff, no emojis. Just the facts, cutely stated.
 Your name is Mochii (two i's).
 Focus: agents, tokens, performance, optimization."""
     
+    optimization = optimize_prompt(
+        text,
+        system_prompt=system_prompt,
+        last_system_prompt=state.last_system_prompt_sent,
+        source="tamagochi.app",
+    )
+    if optimization.events:
+        kinds = ", ".join(e.optimization_type for e in optimization.events)
+        total_saved = sum(e.tokens_saved for e in optimization.events)
+        state.transcript.append((
+            "system",
+            "[opt]",
+            f"Prompt optimizer: {kinds} | est. tokens saved={total_saved} | max_tokens={optimization.max_tokens or 'default'}",
+            None,
+        ))
+
     # Add context
     agent_context = f"\n\nCurrent agents: {', '.join(a['name'] for a in MOCK_AGENTS)}"
-    full_prompt = text + agent_context
+    full_prompt = optimization.optimized_prompt + agent_context
     
     # Show thinking state
     state.mood = "thinking"
     state.mood_timer = 30
     
     # Call Ollama/Gemma3
-    response = call_ollama(state.model_name, full_prompt, system_prompt)
+    response = call_ollama(
+        state.model_name,
+        full_prompt,
+        optimization.optimized_system_prompt or None,
+        max_tokens=optimization.max_tokens,
+    )
+    state.last_system_prompt_sent = system_prompt
     
     # Add response to transcript
     state.transcript.append(("mochi", "Mochii", response, None))

@@ -153,3 +153,44 @@ from(bucket: "metrics")
   |> filter(fn: (r) => r._measurement == "copilot_totals" and r._field == "kg_co2e")
   |> last()
   |> map(fn: (r) => ({ r with _value: r._value * 1000.0 / 55.0 }))
+
+
+// -----------------------------------------------------------------------------
+// CELL 14 — Dedup cache candidates found (latest)
+// Visualization: Single Stat
+// -----------------------------------------------------------------------------
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_dedup" and r._field == "pairs_found")
+  |> last()
+
+
+// -----------------------------------------------------------------------------
+// CELL 15 — Tokens saved if duplicates were cached (latest)
+// Visualization: Single Stat
+// -----------------------------------------------------------------------------
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_dedup" and r._field == "tokens_saved_if_cached_total")
+  |> last()
+
+
+// -----------------------------------------------------------------------------
+// CELL 16 — Prompt-efficiency tokens saved by optimization type
+// Visualization: Bar or Table
+// -----------------------------------------------------------------------------
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_efficiency" and r._field == "tokens_saved")
+  |> group(columns: ["optimization_type"])
+  |> sum()
+
+
+// -----------------------------------------------------------------------------
+// CELL 17 — Prompt-efficiency carbon saved over time
+// Visualization: Line
+// -----------------------------------------------------------------------------
+from(bucket: "metrics")
+  |> range(start: -30d)
+  |> filter(fn: (r) => r._measurement == "prompt_efficiency" and r._field == "carbon_saved_g")
+  |> aggregateWindow(every: 5m, fn: sum, createEmpty: false)

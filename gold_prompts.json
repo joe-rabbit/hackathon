@@ -1,0 +1,39 @@
+[
+  {
+    "name": "python_sort_function",
+    "task_type": "code_generation",
+    "patterns": [
+      "help me write.*python.*function.*sort.*list",
+      "write.*python.*function.*sort.*list",
+      "python.*sort.*list.*function"
+    ],
+    "rewrite": "python sort list -> sorted list. code only."
+  },
+  {
+    "name": "summarize_text",
+    "task_type": "summarization",
+    "patterns": [
+      "^summari[sz]e\\b.*\\b(text|paragraph|article|document|notes)\\b",
+      "\\btl;dr\\b.*\\b(text|article|document)\\b"
+    ],
+    "rewrite": "summarize provided text. concise summary only."
+  },
+  {
+    "name": "sentiment_classification",
+    "task_type": "classification",
+    "patterns": [
+      "\\bclassify\\b.*\\b(sentiment|positive|negative|neutral)\\b",
+      "\\bsentiment\\b.*\\bclassif"
+    ],
+    "rewrite": "classify sentiment. label only: positive, negative, or neutral."
+  },
+  {
+    "name": "bug_fix_snippet",
+    "task_type": "code_generation",
+    "patterns": [
+      "\\bfix the bug\\b.*\\b(ts|tsx|js|jsx|py|pyth|java|go|rs)\\b",
+      "\\bdebug\\b.*\\b(stack trace|exception|error)\\b"
+    ],
+    "rewrite": "fix provided code bug. corrected code or exact fix steps only."
+  }
+]
