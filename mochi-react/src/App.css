@@ -1,0 +1,280 @@
+:root {
+  --bg-main: #1c1c1c;
+  --bg-surface: #121212;
+  --bg-surface2: #262626;
+  --border-color: #444444;
+  
+  --text-main: #ffffff;
+  --text-dim: #a8a8a8;
+  --text-dimmer: #585858;
+
+  --green: #87d787;
+  --pink: #ff87af;
+  --hot: #ff5f87;
+  --mint: #afffff;
+  
+  --mochi-body: #d7d787;
+  --mochi-dark: #303030;
+  --mochi-shine: #ffffff;
+  
+  font-family: 'Courier New', Courier, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  overflow: hidden;
+}
+
+.terminal-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* Colors */
+.fg-main { color: var(--text-main); }
+.fg-dim { color: var(--text-dim); }
+.fg-dimmer { color: var(--text-dimmer); }
+.fg-green { color: var(--green); }
+.fg-pink { color: var(--pink); }
+.fg-hot { color: var(--hot); }
+.fg-mint { color: var(--mint); }
+.fg-border { color: var(--border-color); }
+.bg-surface2 { background-color: var(--bg-surface2); }
+.bold { font-weight: bold; }
+
+/* Status bar */
+.status-bar, .hints-bar {
+  padding: 6px 12px;
+  font-size: 14px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+/* Hero Section */
+.hero-wrapper {
+  flex-shrink: 0;
+}
+
+.hero-nyan {
+  position: relative;
+  height: 160px;
+  overflow: hidden;
+  background-color: var(--bg-main);
+}
+
+.sparkles-container {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.sparkle {
+  position: absolute;
+  font-size: 16px;
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* Rainbow trail */
+.nyan-trail {
+  position: absolute;
+  top: 30px;
+  height: 70px;
+  display: flex;
+  flex-direction: column;
+  z-index: 1;
+}
+
+.rainbow-stripe {
+  flex: 1;
+  min-height: 10px;
+}
+
+/* Mochi Cat Container */
+.mochi-container {
+  position: absolute;
+  z-index: 10;
+}
+
+/* Mochi Pixel Art Sprite */
+.mochi-sprite {
+  display: flex;
+  flex-direction: column;
+  filter: drop-shadow(2px 2px 4px rgba(0,0,0,0.3));
+}
+
+.mochi-row {
+  display: flex;
+  height: 16px;
+  line-height: 16px;
+}
+
+.mochi-cell {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  font-size: 12px;
+  font-weight: bold;
+  text-align: center;
+  line-height: 16px;
+}
+
+.mochi-cell.eye {
+  font-family: monospace;
+}
+
+/* Floor line */
+.floor-line {
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  color: var(--border-color);
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+/* Welcome Section */
+.welcome-text {
+  padding: 12px 0;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.welcome-text > div {
+  margin: 4px 0;
+}
+
+/* Divider */
+.divider {
+  text-align: center;
+  padding: 4px 0;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+/* Transcript */
+.transcript {
+  flex-grow: 1;
+  overflow-y: auto;
+  padding: 10px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+  min-height: 100px;
+}
+
+.transcript-row {
+  display: flex;
+  flex-direction: column;
+}
+
+.transcript-msg {
+  display: flex;
+  align-items: flex-start;
+}
+
+.prefix {
+  display: inline-block;
+  width: 80px;
+  flex-shrink: 0;
+}
+
+/* Cards */
+.card {
+  margin: 8px 0 8px 80px;
+  padding: 8px 0;
+}
+
+.card-header {
+  display: flex;
+  margin-bottom: 4px;
+}
+
+.card-divider {
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+
+.card-row {
+  display: flex;
+  margin: 2px 0;
+}
+
+.detail-title {
+  margin-bottom: 8px;
+}
+
+.detail-row {
+  margin: 2px 0;
+}
+
+.detail-row .fg-dim {
+  display: inline-block;
+  width: 120px;
+}
+
+/* Input Prompt */
+.prompt-area {
+  display: flex;
+  padding: 10px 20px;
+  align-items: center;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-color);
+}
+
+.prompt-area input {
+  flex-grow: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-main);
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+.prompt-area input::placeholder {
+  color: var(--text-dimmer);
+}
+
+/* Hints bar */
+.hints-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.hint-sep {
+  color: transparent;
+}
+
+/* Scrollbar styling */
+.transcript::-webkit-scrollbar {
+  width: 8px;
+}
+
+.transcript::-webkit-scrollbar-track {
+  background: var(--bg-main);
+}
+
+.transcript::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 4px;
+}
+
+.transcript::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dimmer);
+}

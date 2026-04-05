@@ -20,7 +20,34 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - hackathon-network
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hackathon-app
+    restart: unless-stopped
+    volumes:
+      - ./dashboard:/hackathon/dashboard
+      - ./pI:/hackathon/pI
+      - ./tamagochi:/hackathon/tamagochi
+      - ./requirements.txt:/hackathon/requirements.txt
+    environment:
+      - DASHBOARD_URL=http://influxdb:8086
+    depends_on:
+      - influxdb
+    networks:
+      - hackathon-network
+    stdin_open: true
+    tty: true
+    command: bash
 
 volumes:
   influxdb2-data:
   influxdb2-config:
+
+networks:
+  hackathon-network:
+    driver: bridge
