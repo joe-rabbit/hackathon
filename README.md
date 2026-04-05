@@ -204,23 +204,27 @@ MOCHI_DEVICE_NAME=edge-01
 If you want to spin this project up from scratch on a new machine, follow these exact steps:
 
 1. **Set up the virtual environment:**
+
    ```bash
    python -m venv .venv
    source .venv/bin/activate
    ```
 
 2. **Install dependencies:**
+
    ```bash
    pip install -r requirements.txt
    ```
 
 3. **Configure environment variables:**
+
    ```bash
    cp .env.example .env
    # Or create one manually with MOCHI_USE_MOCKS=1
    ```
 
 4. **Start the Local LLM (Ollama):**
+
    ```bash
    # Ensure ollama is installed on your OS
    ollama pull gemma3:1b
@@ -231,17 +235,16 @@ If you want to spin this project up from scratch on a new machine, follow these 
    - **Terminal UI:** `python -m tamagochi.app`
    - **Web Dashboard:** `streamlit run dashboard/app.py`
 
-
-1. **Start mock mode** with intentionally wasteful agents
-2. **Open TUI**: `python -m tamagochi.app`
-3. **See Mochi alive** in the terminal with blinking animation
-4. **Run `/agents`** to see all agents
-5. **Run `/inspect camera-agent`** to see the hot agent
-6. **Ask**: _"Why is camera-agent wasting energy?"_
-7. **Run `/optimize camera-agent`** to trigger optimization
-8. **Watch Mochi celebrate** 🎉
-9. **Run `/compare camera-agent`** to see before/after
-10. **Press `Ctrl+D`** to open the dashboard
+6. **Start mock mode** with intentionally wasteful agents
+7. **Open TUI**: `python -m tamagochi.app`
+8. **See Mochi alive** in the terminal with blinking animation
+9. **Run `/agents`** to see all agents
+10. **Run `/inspect camera-agent`** to see the hot agent
+11. **Ask**: _"Why is camera-agent wasting energy?"_
+12. **Run `/optimize camera-agent`** to trigger optimization
+13. **Watch Mochi celebrate** 🎉
+14. **Run `/compare camera-agent`** to see before/after
+15. **Press `Ctrl+D`** to open the dashboard
 
 ## 🔌 Backend API Contract
 
